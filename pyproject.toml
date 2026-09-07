@@ -1,0 +1,31 @@
+[build-system]
+requires = ["hatchling==1.27.0"]
+build-backend = "hatchling.build"
+
+[project]
+name = "mypyrag"
+version = "0.1.0"
+description = "Restartable Docling document ingestion"
+requires-python = ">=3.12,<3.13"
+dependencies = ["docling>=2.70,<3", "python-dotenv>=1.1,<2", "filelock>=3.18,<4"]
+
+[project.scripts]
+mypyrag = "mypyrag.cli:main"
+
+[dependency-groups]
+dev = ["pytest>=8,<10", "ruff>=0.12,<1", "mypy>=1.15,<2"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+markers = ["integration: real Docling conversion (explicit opt-in)"]
+addopts = "-m 'not integration'"
+
+[tool.ruff]
+line-length = 100
+
+[tool.mypy]
+python_version = "3.12"
+files = ["src/mypyrag"]
+strict = true
+ignore_missing_imports = true
+

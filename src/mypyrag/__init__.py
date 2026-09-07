@@ -1,0 +1,1 @@
+"""MyPyRag stage-one ingestion."""

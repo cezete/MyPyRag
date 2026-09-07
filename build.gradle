@@ -1,0 +1,44 @@
+// Thin orchestration only; pyproject.toml and uv.lock own Python dependencies.
+def windows = System.getProperty('os.name').toLowerCase().contains('windows')
+def python = layout.projectDirectory.file(windows ? '.venv/Scripts/python.exe' : '.venv/bin/python').asFile
+
+tasks.register('setup', Exec) {
+    workingDir projectDir
+    commandLine 'uv', 'sync', '--locked', '--python', '3.12', '--cache-dir', '.uv-cache'
+}
+tasks.register('test', Exec) {
+    dependsOn 'setup'
+    workingDir projectDir
+    commandLine python, '-m', 'pytest'
+}
+tasks.register('run', Exec) {
+    dependsOn 'setup'
+    workingDir projectDir
+    commandLine python, '-m', 'mypyrag.cli', 'watch'
+}
+tasks.register('lint', Exec) {
+    dependsOn 'setup'
+    workingDir projectDir
+    commandLine python, '-m', 'ruff', 'check', '.'
+}
+tasks.register('typecheck', Exec) {
+    dependsOn 'setup'
+    workingDir projectDir
+    commandLine python, '-m', 'mypy'
+}
+tasks.register('verify') { dependsOn 'lint', 'typecheck', 'test' }
+tasks.register('cleanGenerated') {
+    doLast {
+        // Fixed test-only output; never traverse a redirected/symlinked directory.
+        def output = new File(projectDir, 'test-output')
+        def expected = projectDir.canonicalFile.toPath().resolve('test-output')
+        if (output.canonicalFile.toPath() != expected) {
+            throw new GradleException('Refusing to clean redirected test-output')
+        }
+        if (output.exists()) {
+            java.nio.file.Files.walk(output.toPath()).withCloseable { paths ->
+                paths.sorted(Comparator.reverseOrder()).forEach { java.nio.file.Files.delete(it) }
+            }
+        }
+    }
+}
