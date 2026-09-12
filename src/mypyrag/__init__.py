@@ -1,1 +1,1 @@
-"""MyPyRag stage-one ingestion."""
+"""Restartable document ingestion, pgvector indexing, and semantic search."""

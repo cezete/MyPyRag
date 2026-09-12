@@ -16,6 +16,16 @@ tasks.register('run', Exec) {
     workingDir projectDir
     commandLine python, '-m', 'mypyrag.cli', 'watch'
 }
+tasks.register('dbMigrate', Exec) {
+    dependsOn 'setup'
+    workingDir projectDir
+    commandLine python, '-m', 'mypyrag.cli', 'db', 'migrate'
+}
+tasks.register('dbStatus', Exec) {
+    dependsOn 'setup'
+    workingDir projectDir
+    commandLine python, '-m', 'mypyrag.cli', 'db', 'status'
+}
 tasks.register('lint', Exec) {
     dependsOn 'setup'
     workingDir projectDir

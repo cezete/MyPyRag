@@ -68,7 +68,7 @@ def test_config_env_precedence(config, tmp_path, monkeypatch):
     loaded = Config.load(tmp_path)
     assert loaded.poll_interval_seconds == 7
     assert loaded.in_dir == tmp_path / "inbox"
-    assert loaded.qdrant_vector_size == 768
+    assert loaded.embedding_vector_size == 768
 
 
 @pytest.mark.parametrize(
@@ -78,7 +78,6 @@ def test_config_env_precedence(config, tmp_path, monkeypatch):
         ("POLL_INTERVAL_SECONDS", "0", "integer range"),
         ("FILE_STABLE_SECONDS", "-1", "integer range"),
         ("MAX_STAGE", "BROKEN", "expected CONVERTED"),
-        ("MAX_STAGE", "INDEXED", "not implemented"),
         ("IN_DIR", "", "must not be empty"),
         ("DOCLING_JSON_FILENAME", "../bad.json", "plain filename"),
         ("LOG_LEVEL", "mystery", "unknown logging"),

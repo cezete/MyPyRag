@@ -10,6 +10,7 @@ from filelock import FileLock
 from mypyrag.chunker import ChunkArtifactWriter, DoclingHybridChunker, StructuredChunker
 from mypyrag.config import Config
 from mypyrag.converter import FORMATS, Converter
+from mypyrag.indexing import NORMALIZATION_VERSION, IndexingService
 from mypyrag.model import Manifest, State, now, reached
 from mypyrag.storage import (
     StabilityTracker,
@@ -28,12 +29,17 @@ log = logging.getLogger(__name__)
 
 class Pipeline:
     def __init__(
-        self, config: Config, converter: Converter, chunker: StructuredChunker | None = None
+        self,
+        config: Config,
+        converter: Converter,
+        chunker: StructuredChunker | None = None,
+        indexer: IndexingService | None = None,
     ) -> None:
         self.config = config
         self.converter = converter
         self.chunker = chunker or DoclingHybridChunker(config)
         self.chunk_writer = ChunkArtifactWriter()
+        self.indexer = indexer
         self.stability = StabilityTracker(config.file_stable_seconds)
         for root in self.roots:
             root.mkdir(parents=True, exist_ok=True)
@@ -159,11 +165,50 @@ class Pipeline:
         sync_directory(self.config.in_dir)
         sync_directory(self.config.error_dir)
 
+    def _move_done(self, directory: Path) -> Path:
+        target = self.config.done_dir / directory.name
+        if target.exists():
+            raise ValueError(f"DONE target already exists: {target}")
+        directory.rename(target)
+        sync_directory(self.config.in_dir)
+        sync_directory(self.config.done_dir)
+        return target
+
+    def _finish_indexed(self, directory: Path, manifest: Manifest) -> bool:
+        try:
+            chunks_dir = directory / "CHUNKS"
+            if chunks_dir.is_symlink() or chunks_dir.resolve().parent != directory.resolve():
+                raise ValueError("Unsafe CHUNKS directory")
+            removed = 0
+            for artifact in chunks_dir.glob("*.txt"):
+                if artifact.is_symlink() or artifact.parent.resolve() != chunks_dir.resolve():
+                    raise ValueError(f"Unsafe TXT artifact: {artifact}")
+                artifact.unlink()
+                removed += 1
+            if manifest.current_state != State.DONE:
+                manifest.transition(State.DONE)
+                save_manifest(directory, manifest)
+            target = self._move_done(directory)
+            log.info(
+                "Completed document_id=%s txt_removed=%d directory=%s",
+                manifest.document_id[:12],
+                removed,
+                target,
+            )
+            return True
+        except Exception:
+            # The DB commit and INDEXED manifest remain authoritative. A later cycle/resume
+            # repeats only cleanup and the atomic directory move, never embedding.
+            log.exception("Could not finalize INDEXED document directory=%s", directory)
+            return False
+
     def _advance(self, directory: Path) -> bool:
         manifest: Manifest | None = None
         failed_stage = "UNKNOWN"
         try:
             manifest = load_manifest(directory)
+            if manifest.last_successful_state in {State.INDEXED, State.DONE}:
+                return self._finish_indexed(directory, manifest)
             if manifest.current_state == State.ERROR:
                 try:
                     self._move_error(directory)
@@ -194,24 +239,61 @@ class Pipeline:
                 log.info("Converted document_id=%s", manifest.document_id)
             if reached(manifest.last_successful_state, self.config.max_stage):
                 return True
-            failed_stage = State.CHUNKING
-            manifest.transition(State.CHUNKING)
+            if manifest.last_successful_state == State.CONVERTED:
+                failed_stage = State.CHUNKING
+                manifest.transition(State.CHUNKING)
+                save_manifest(directory, manifest)
+                json_dir = directory / "JSON"
+                document_json = json_dir / self.config.docling_json_filename
+                if json_dir.is_symlink() or document_json.is_symlink():
+                    raise ValueError("Docling JSON path must not contain a symlink")
+                if (
+                    document_json.resolve().parent != json_dir.resolve()
+                    or not document_json.is_file()
+                ):
+                    raise ValueError(f"Missing DoclingDocument JSON: JSON/{document_json.name}")
+                chunks = self.chunker.chunks(document_json)
+                manifest.chunk_count = self.chunk_writer.write(
+                    directory, manifest, self.chunker.spec, chunks
+                )
+                manifest.chunking = self.chunker.spec.manifest_dict()
+                manifest.transition(State.CHUNKED)
+                save_manifest(directory, manifest)
+                log.info(
+                    "Chunked document_id=%s chunks=%d",
+                    manifest.document_id,
+                    manifest.chunk_count,
+                )
+            if reached(manifest.last_successful_state, self.config.max_stage):
+                return True
+            failed_stage = State.INDEXING
+            manifest.transition(State.INDEXING)
             save_manifest(directory, manifest)
-            json_dir = directory / "JSON"
-            document_json = json_dir / self.config.docling_json_filename
-            if json_dir.is_symlink() or document_json.is_symlink():
-                raise ValueError("Docling JSON path must not contain a symlink")
-            if document_json.resolve().parent != json_dir.resolve() or not document_json.is_file():
-                raise ValueError(f"Missing DoclingDocument JSON: JSON/{document_json.name}")
-            chunks = self.chunker.chunks(document_json)
-            manifest.chunk_count = self.chunk_writer.write(
-                directory, manifest, self.chunker.spec, chunks
+            if self.indexer is None:
+                raise RuntimeError("Indexing service is not configured")
+            count, digest, elapsed = self.indexer.index(directory, manifest)
+            if count != manifest.chunk_count:
+                raise RuntimeError(
+                    f"Indexed chunk count mismatch: expected {manifest.chunk_count}, got {count}"
+                )
+            manifest.embedding_model = self.config.embedding_model
+            manifest.embedding_model_digest = digest
+            manifest.embedding_vector_size = self.config.embedding_vector_size
+            manifest.embedding_normalization = NORMALIZATION_VERSION
+            manifest.indexed_point_count = count
+            manifest.indexed_at = now()
+            manifest.postgres_target = self.indexer.store.logical_target()
+            manifest.database_schema_version = 1
+            manifest.transition(State.INDEXED)
+            save_manifest(directory, manifest)
+            log.info(
+                "Indexed document_id=%s universe=%s chunks=%d elapsed_seconds=%.3f",
+                manifest.document_id[:12],
+                manifest.universe,
+                count,
+                elapsed,
             )
-            manifest.chunking = self.chunker.spec.manifest_dict()
-            manifest.transition(State.CHUNKED)
-            save_manifest(directory, manifest)
-            log.info("Chunked document_id=%s chunks=%d", manifest.document_id, manifest.chunk_count)
-            return True
+            return self._finish_indexed(directory, manifest)
         except Exception as exc:
             log.exception("Document processing failed directory=%s", directory)
             if manifest is not None:
@@ -260,3 +342,63 @@ class Pipeline:
             self._recover_receipts()
             directory = self._register(path)
             return True if directory is None else self._advance(directory)
+
+    def resume(self, directory: Path) -> bool:
+        with self.lock:
+            directory = self._validated_document_directory(directory)
+            manifest = load_manifest(directory)
+            if directory.parent == self.config.done_dir:
+                raise ValueError("DONE documents cannot be resumed")
+            if directory.parent == self.config.error_dir:
+                target = self.config.in_dir / directory.name
+                if target.exists():
+                    raise ValueError(f"Resume target already exists: {target}")
+                manifest.current_state = manifest.last_successful_state
+                manifest.failed_stage = None
+                manifest.last_error = None
+                manifest.updated_at = now()
+                save_manifest(directory, manifest)
+                directory.rename(target)
+                sync_directory(self.config.error_dir)
+                sync_directory(self.config.in_dir)
+                directory = target
+            return self._advance(directory)
+
+    def retry_errors(self) -> bool:
+        ok = True
+        for directory in sorted(self.config.error_dir.iterdir()):
+            if directory.is_dir() and not directory.is_symlink() and (directory / "manifest.json").is_file():
+                try:
+                    if not self.resume(directory):
+                        ok = False
+                except Exception:
+                    log.exception("Could not retry document=%s", directory)
+                    ok = False
+        return ok
+
+    def set_universe(self, directory: Path, universe: str) -> tuple[str, str]:
+        with self.lock:
+            directory = self._validated_document_directory(directory)
+            manifest = load_manifest(directory)
+            if manifest.current_state in {State.INDEXING, State.INDEXED, State.DONE} or (
+                manifest.last_successful_state in {State.INDEXED, State.DONE}
+            ):
+                raise ValueError("Universe change after indexing requires explicit reindexing")
+            if manifest.current_state not in {State.CONVERTED, State.CHUNKED, State.ERROR}:
+                raise ValueError(f"Universe cannot be changed in state {manifest.current_state}")
+            normalized = self.config.normalize_universe(universe)
+            previous = manifest.universe
+            manifest.universe = normalized
+            manifest.updated_at = now()
+            save_manifest(directory, manifest)
+            return previous, normalized
+
+    def _validated_document_directory(self, directory: Path) -> Path:
+        candidate = directory.resolve()
+        if directory.is_symlink() or not candidate.is_dir():
+            raise ValueError("Document directory must be a regular directory")
+        if not any(candidate.parent == root.resolve() for root in self.roots):
+            raise ValueError("Document directory must be a direct child of IN, ERROR or DONE")
+        if not (candidate / "manifest.json").is_file() or (candidate / "manifest.json").is_symlink():
+            raise ValueError("Document manifest is missing or unsafe")
+        return candidate

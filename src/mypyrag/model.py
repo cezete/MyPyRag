@@ -52,6 +52,7 @@ class Manifest:
     source_size_bytes: int
     received_at: str
     updated_at: str
+    universe: str = "n.a."
     schema_version: int = 1
     current_state: State = State.RECEIVED
     last_successful_state: State = State.RECEIVED
@@ -60,7 +61,12 @@ class Manifest:
     attempt_count: int = 0
     docling_version: str | None = None
     embedding_model: str | None = None
+    embedding_model_digest: str | None = None
     embedding_vector_size: int | None = None
+    embedding_normalization: str | None = None
+    indexed_at: str | None = None
+    postgres_target: str | None = None
+    database_schema_version: int | None = None
     chunking: dict[str, Any] | None = None
     chunk_count: int = 0
     indexed_point_count: int = 0
@@ -70,7 +76,10 @@ class Manifest:
 
     @classmethod
     def from_dict(cls, data: dict[str, Any]) -> "Manifest":
-        result = cls(**data)
+        # Schema v1 manifests from the first two stages did not contain universe.
+        # Treat it logically as n.a. without rewriting the file on a read.
+        values = {"universe": "n.a.", **data}
+        result = cls(**values)
         if result.schema_version != 1:
             raise ValueError("Unsupported manifest schema_version")
         result.current_state = State(result.current_state)
@@ -93,8 +102,11 @@ class Manifest:
             State.CONVERTING: {State.CONVERTING, State.CONVERTED, State.ERROR},
             State.CONVERTED: {State.CHUNKING, State.ERROR},
             State.CHUNKING: {State.CHUNKING, State.CHUNKED, State.ERROR},
-            State.CHUNKED: {State.ERROR},
-            State.ERROR: {State.CONVERTING, State.CHUNKING, State.ERROR},
+            State.CHUNKED: {State.INDEXING, State.ERROR},
+            State.INDEXING: {State.INDEXING, State.INDEXED, State.ERROR},
+            State.INDEXED: {State.DONE, State.ERROR},
+            State.DONE: set(),
+            State.ERROR: {State.CONVERTING, State.CHUNKING, State.INDEXING, State.ERROR},
         }
         if target not in allowed.get(self.current_state, set()):
             raise ValueError(f"Invalid transition: {self.current_state} -> {target}")
@@ -102,8 +114,12 @@ class Manifest:
             raise ValueError("Conversion requires last_successful_state=RECEIVED")
         if target == State.CHUNKING and self.last_successful_state != State.CONVERTED:
             raise ValueError("Chunking requires last_successful_state=CONVERTED")
+        if target == State.INDEXING and self.last_successful_state != State.CHUNKED:
+            raise ValueError("Indexing requires last_successful_state=CHUNKED")
+        if target == State.DONE and self.last_successful_state != State.INDEXED:
+            raise ValueError("DONE requires last_successful_state=INDEXED")
         self.current_state = target
-        if target in {State.CONVERTED, State.CHUNKED}:
+        if target in {State.CONVERTED, State.CHUNKED, State.INDEXED, State.DONE}:
             self.last_successful_state = target
             self.failed_stage = None
             self.last_error = None

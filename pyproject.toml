@@ -5,9 +5,16 @@ build-backend = "hatchling.build"
 [project]
 name = "mypyrag"
 version = "0.1.0"
-description = "Restartable Docling document ingestion"
+description = "Restartable Docling ingestion and PostgreSQL/pgvector semantic search"
 requires-python = ">=3.12,<3.13"
-dependencies = ["docling>=2.70,<3", "python-dotenv>=1.1,<2", "filelock>=3.18,<4"]
+dependencies = [
+    "docling>=2.70,<3",
+    "python-dotenv>=1.1,<2",
+    "filelock>=3.18,<4",
+    "httpx>=0.28,<1",
+    "psycopg[binary]>=3.2,<4",
+    "pgvector>=0.4,<1",
+]
 
 [project.scripts]
 mypyrag = "mypyrag.cli:main"
@@ -17,7 +24,7 @@ dev = ["pytest>=8,<10", "ruff>=0.12,<1", "mypy>=1.15,<2"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
-markers = ["integration: real Docling conversion (explicit opt-in)"]
+markers = ["integration: external-service or real Docling test (explicit opt-in)"]
 addopts = "-m 'not integration'"
 
 [tool.ruff]
@@ -28,4 +35,3 @@ python_version = "3.12"
 files = ["src/mypyrag"]
 strict = true
 ignore_missing_imports = true
-
