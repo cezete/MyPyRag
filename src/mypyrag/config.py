@@ -23,6 +23,7 @@ class Config:
     docling_json_filename: str = "document.json"
     chunker: str = "hybrid"
     chunk_max_tokens: int = 512
+    chunk_tokenizer: str = "nomic-ai/nomic-embed-text-v1.5"
     ollama_url: str = "http://192.168.3.32:11434"
     embedding_model: str = "nomic-embed-text:latest"
     embedding_vector_size: int = 768
@@ -35,9 +36,9 @@ class Config:
     def __post_init__(self) -> None:
         if not isinstance(self.max_stage, MaxStage):
             raise TypeError("MYPYRAG_MAX_STAGE must be CONVERTED, CHUNKED or INDEXED")
-        if self.max_stage != MaxStage.CONVERTED:
+        if self.max_stage == MaxStage.INDEXED:
             raise ValueError(
-                f"MYPYRAG_MAX_STAGE={self.max_stage} is not implemented; use CONVERTED"
+                "MYPYRAG_MAX_STAGE=INDEXED is not implemented; use CONVERTED or CHUNKED"
             )
         for name in (
             "poll_interval_seconds",
@@ -51,6 +52,10 @@ class Config:
                 raise ValueError(f"MYPYRAG_{name.upper()}: invalid integer range")
         if self.log_level not in logging.getLevelNamesMapping():
             raise ValueError("MYPYRAG_LOG_LEVEL: unknown logging level")
+        if self.chunker != "hybrid":
+            raise ValueError("MYPYRAG_CHUNKER: only 'hybrid' is supported")
+        if self.chunk_max_tokens > 2048:
+            raise ValueError("MYPYRAG_CHUNK_MAX_TOKENS must not exceed the 2048-token context")
         name = self.docling_json_filename
         if not name or name in {".", ".."} or any(c in name for c in '/\\:<>"|?*'):
             raise ValueError("MYPYRAG_DOCLING_JSON_FILENAME must be a plain filename")

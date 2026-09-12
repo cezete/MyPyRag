@@ -28,6 +28,22 @@ def atomic_json(path: Path, data: dict[str, Any]) -> None:
         temporary.unlink(missing_ok=True)
 
 
+def atomic_text(path: Path, text: str) -> None:
+    """Write exact UTF-8 text through a same-directory atomic replacement."""
+    fd, name = tempfile.mkstemp(prefix=f".{path.name}.", suffix=".tmp", dir=path.parent)
+    temporary = Path(name)
+    try:
+        # newline="" preserves the caller's exact text bytes on every platform.
+        with os.fdopen(fd, "w", encoding="utf-8", newline="") as stream:
+            stream.write(text)
+            stream.flush()
+            os.fsync(stream.fileno())
+        os.replace(temporary, path)
+        sync_directory(path.parent)
+    finally:
+        temporary.unlink(missing_ok=True)
+
+
 def sync_directory(path: Path) -> None:
     if os.name == "posix":
         descriptor = os.open(path, os.O_RDONLY | getattr(os, "O_DIRECTORY", 0))

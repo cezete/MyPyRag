@@ -1,4 +1,4 @@
-"""One state-driven application, currently stopping at CONVERTED."""
+"""One restartable state-driven ingestion application."""
 
 import json
 import logging
@@ -7,6 +7,7 @@ from pathlib import Path
 
 from filelock import FileLock
 
+from mypyrag.chunker import ChunkArtifactWriter, DoclingHybridChunker, StructuredChunker
 from mypyrag.config import Config
 from mypyrag.converter import FORMATS, Converter
 from mypyrag.model import Manifest, State, now, reached
@@ -26,9 +27,13 @@ log = logging.getLogger(__name__)
 
 
 class Pipeline:
-    def __init__(self, config: Config, converter: Converter) -> None:
+    def __init__(
+        self, config: Config, converter: Converter, chunker: StructuredChunker | None = None
+    ) -> None:
         self.config = config
         self.converter = converter
+        self.chunker = chunker or DoclingHybridChunker(config)
+        self.chunk_writer = ChunkArtifactWriter()
         self.stability = StabilityTracker(config.file_stable_seconds)
         for root in self.roots:
             root.mkdir(parents=True, exist_ok=True)
@@ -156,6 +161,7 @@ class Pipeline:
 
     def _advance(self, directory: Path) -> bool:
         manifest: Manifest | None = None
+        failed_stage = "UNKNOWN"
         try:
             manifest = load_manifest(directory)
             if manifest.current_state == State.ERROR:
@@ -166,31 +172,52 @@ class Pipeline:
                 return False
             if reached(manifest.last_successful_state, self.config.max_stage):
                 return True
-            manifest.transition(State.CONVERTING)
+            if manifest.last_successful_state == State.RECEIVED:
+                failed_stage = State.CONVERTING
+                manifest.transition(State.CONVERTING)
+                save_manifest(directory, manifest)
+                source = source_path(directory, manifest.source_relative_path)
+                if sha256(source) != manifest.source_sha256:
+                    raise ValueError("Source SHA-256 mismatch")
+                if source.suffix.lower() not in FORMATS:
+                    raise ValueError(f"Unsupported document format: {source.suffix}")
+                output_dir = directory / "JSON"
+                if output_dir.is_symlink():
+                    raise ValueError("JSON directory must not be a symlink")
+                output_dir.mkdir(exist_ok=True)
+                manifest.docling_version = self.converter.version
+                self.converter.convert(source, output_dir / self.config.docling_json_filename)
+                if sha256(source) != manifest.source_sha256:
+                    raise ValueError("Source changed during conversion")
+                manifest.transition(State.CONVERTED)
+                save_manifest(directory, manifest)
+                log.info("Converted document_id=%s", manifest.document_id)
+            if reached(manifest.last_successful_state, self.config.max_stage):
+                return True
+            failed_stage = State.CHUNKING
+            manifest.transition(State.CHUNKING)
             save_manifest(directory, manifest)
-            source = source_path(directory, manifest.source_relative_path)
-            if sha256(source) != manifest.source_sha256:
-                raise ValueError("Source SHA-256 mismatch")
-            if source.suffix.lower() not in FORMATS:
-                raise ValueError(f"Unsupported document format: {source.suffix}")
-            output_dir = directory / "JSON"
-            if output_dir.is_symlink():
-                raise ValueError("JSON directory must not be a symlink")
-            output_dir.mkdir(exist_ok=True)
-            manifest.docling_version = self.converter.version
-            self.converter.convert(source, output_dir / self.config.docling_json_filename)
-            if sha256(source) != manifest.source_sha256:
-                raise ValueError("Source changed during conversion")
-            manifest.transition(State.CONVERTED)
+            json_dir = directory / "JSON"
+            document_json = json_dir / self.config.docling_json_filename
+            if json_dir.is_symlink() or document_json.is_symlink():
+                raise ValueError("Docling JSON path must not contain a symlink")
+            if document_json.resolve().parent != json_dir.resolve() or not document_json.is_file():
+                raise ValueError(f"Missing DoclingDocument JSON: JSON/{document_json.name}")
+            chunks = self.chunker.chunks(document_json)
+            manifest.chunk_count = self.chunk_writer.write(
+                directory, manifest, self.chunker.spec, chunks
+            )
+            manifest.chunking = self.chunker.spec.manifest_dict()
+            manifest.transition(State.CHUNKED)
             save_manifest(directory, manifest)
-            log.info("Converted document_id=%s", manifest.document_id)
+            log.info("Chunked document_id=%s chunks=%d", manifest.document_id, manifest.chunk_count)
             return True
         except Exception as exc:
             log.exception("Document processing failed directory=%s", directory)
             if manifest is not None:
                 try:
                     manifest.attempt_count += 1
-                    manifest.failed_stage = "CONVERTING"
+                    manifest.failed_stage = str(failed_stage)
                     manifest.last_error = f"{type(exc).__name__}: {exc}"[:1000]
                     manifest.current_state = State.ERROR
                     manifest.updated_at = now()

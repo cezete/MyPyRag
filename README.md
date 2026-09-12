@@ -1,10 +1,10 @@
 # MyPyRag
 
-Python 3.12 alapú, újraindítható dokumentum-ingestion. Ez a verzió kizárólag
-az első lépcsőt valósítja meg: `RECEIVED → CONVERTING → CONVERTED`.
-A forrás változatlanul megmarad; a Docling natív JSON-ja kerül mentésre és
-DoclingDocumentként visszatöltésre. A `CHUNKS` üres, a dokumentum az `IN` alatt
-marad. Nincs Ollama- vagy Qdrant-hívás.
+Python 3.12 alapú, újraindítható dokumentum-ingestion és strukturált chunkolás:
+`RECEIVED → CONVERTING → CONVERTED → CHUNKING → CHUNKED`. A forrás változatlanul
+megmarad; a chunkolás kizárólag a veszteségmentesen mentett `JSON/document.json`
+`DoclingDocument` objektummá történő visszatöltése után indul. A dokumentum az
+`IN` alatt marad. Nincs embedding-, Ollama-, PostgreSQL- vagy Qdrant-hívás.
 
 ## Telepítés Windows alatt (PowerShell)
 
@@ -62,8 +62,22 @@ A `watch` Ctrl+C-vel leállítható. Exit code: 0 siker (a felismert duplikátum
 hibás CLI-szintaxisnál 2. A `status` egyedi dokumentumlistát és állapotösszesítést
 ír ki, sérült manifestet és befejezetlen átvételt is jelez. Nem indít Doclingot.
 
-Csak `MYPYRAG_MAX_STAGE=CONVERTED` használható. A séma ismeri a `CHUNKED` és
-`INDEXED` értékeket, de induláskor jelzi, hogy még nem implementáltak.
+`MYPYRAG_MAX_STAGE=CONVERTED` a natív JSON mentése után megáll;
+`MYPYRAG_MAX_STAGE=CHUNKED` ugyanabban a futásban továbbhalad a chunk artifactokig.
+Az `INDEXED` ismert, de szándékosan nem implementált állapot, ezért konfigurációs
+hibát ad. A chunker jelenleg csak `hybrid` lehet, a tokenlimit 1–2048 közötti.
+A második lépcső ajánlott `.env` beállításai (explicit `.env` nélkül a kompatibilis
+kódalapérték továbbra is `CONVERTED`):
+
+```dotenv
+MYPYRAG_MAX_STAGE=CHUNKED
+MYPYRAG_CHUNKER=hybrid
+MYPYRAG_CHUNK_MAX_TOKENS=512
+MYPYRAG_CHUNK_TOKENIZER=nomic-ai/nomic-embed-text-v1.5
+```
+
+Az Ollama/Qdrant mezők továbbra is típusosan jelen vannak, de ebben a lépcsőben
+csak a szintaxisukat ellenőrizzük, a szolgáltatásokat nem érjük el.
 Az Ollama/Qdrant mezők típusosan jelen vannak; URL-szintaxist ellenőrzünk,
 szolgáltatáselérhetőséget nem. A hiányzó értékek alapértéket kapnak; az explicit
 üres érték, hibás szám, negatív intervallum és ismeretlen állapot hiba.
@@ -88,9 +102,78 @@ majd a teljes másolatot nevezd át az `IN` gyökerében.
 docs/IN/manual--a1b2c3d4/
 ├── source/manual.pdf
 ├── JSON/document.json
-├── CHUNKS/
+├── CHUNKS/0001.txt
+├── CHUNKS/0001.json
 └── manifest.json
 ```
+
+## Strukturált chunkolás
+
+A normál szöveget a Docling 2.x `HybridChunker` dolgozza fel. A beadott tokenizer
+a `nomic-ai/nomic-embed-text-v1.5` Hugging Face tokenizer, amely megfelel a későbbi
+`nomic-embed-text:latest` modell tokenizálásának. Első éles használatkor a tokenizer
+kis konfigurációs fájljait a Hugging Face kliensnek elérhetővé kell tenni vagy előre
+cache-elni; a unit tesztek lokális fake tokenizert használnak. A HybridChunker a
+tokenizer által mért, kontextussal együtt számított legfeljebb 512 tokent tartja.
+A limit konfigurálható és a 2048 tokenes célkontextusnál nem lehet nagyobb.
+
+Minden chunk két szövegréteget tartalmaz:
+
+- `text`: a chunk saját, ember által olvasható tartalma;
+- `embedding_text`: a Docling `contextualize()` által hozzáadott dokumentumcím/
+  címsorútvonal és a tartalom, tábláknál pedig címsorok, képaláírás, kulcsmezők és
+  az `oszlop: érték` sorreprezentáció. A `.txt` pontosan ezt tárolja, záró sortörés
+  hozzáadása nélkül.
+
+A `document_id`, `chunk_id`, indexek, hashértékek, útvonalak, verziók és időbélyegek
+csak JSON metadata; nem kerülnek az embedding szövegébe. Oldalszámok és Docling
+item reference-ek külön mezőben maradnak. A `structural_path` jelenleg a Docling
+által megbízhatóan visszaadott címsorútvonal.
+
+### Táblázatok
+
+A HybridChunker táblachunkjai nem kerülnek közvetlenül a kimenetbe. A program a
+Docling `TableData.table_cells` koordinátáiból, row/column spanekből és
+`column_header` jelölésekből rekonstruálja a rácsot, így ugyanaz a tartalom nem
+duplikálódik. Minden logikai adatsor külön `table_row` chunk, benne olvasható
+`Oszlop: érték` párokkal. Ha nincs Docling által jelölt fejléc, nem találunk ki
+nevet: `column_1`, `column_2`, … semleges jelölés készül, és
+`header_reconstructed=false` kerül a metadata-ba.
+
+A kulcsmező-felismerés kis-/nagybetűtől és aláhúzástól függetlenül az address,
+identifier, name, function, command, opcode, register, code, number és id
+oszlopneveket keresi. Function/command/name esetén egy pont előtti egyszavas
+szimbólumot (például `SCINIT`) őriz kulcsként; más esetben a teljes értéket.
+Túl hosszú sor csak saját mezőhatárain belül, végső esetben egyetlen mező értékének
+szóhatárain darabolódik. Minden részben ismétlődik a strukturális kontextus és a
+kulcsmező, valamint `part_index`/`part_count` készül. Egyetlen, önmagában a limitnél
+hosszabb oszthatatlan token vagy a kötelező ismételt kontextus kivételesen túllépheti
+a határt; adatot nem csonkítunk.
+
+### Azonosítók és fingerprint
+
+A `chunk_index` egyalapú, hézagmentes és a kimeneti sorrenddel azonos. A fájlnév
+legalább négyjegyű, nagyobb darabszámnál automatikusan szélesebb. A `chunk_id`
+determinista UUID5, rögzített MyPyRag névtérben, ebből a névalapból:
+
+```text
+document_id : chunking_fingerprint : chunk_index : text_sha256
+```
+
+A fingerprint a rendezett, tömör UTF-8 JSON-nal kanonizált chunkernévből,
+implementációs sémaverzióból, maximális tokenszámból, tokenizerazonosítóból,
+kontextusszerializálási módból és táblastratégia-verzióból számított SHA-256.
+A `text_sha256` és `embedding_text_sha256` az adott mező pontos UTF-8 bájtjainak
+hashértéke.
+
+### Atomi kimenet
+
+A teljes készlet dokumentumon belüli egyedi staging könyvtárban készül. A program
+visszaolvassa az összes JSON-t, ellenőrzi a sémát, indexeket, párokat, hashértékeket,
+ürességet és azonosító-egyediséget, majd könyvtárszintű cserével publikálja. Meglévő
+készlet ideiglenes backupból visszaállítható, ha a publikálás megszakad. A manifest
+csak ezután kap `CHUNKED`, fingerprint és ellenőrzött `chunk_count` értéket. Azonos
+bemenet/configuráció az időbélyegen kívül azonos szemantikai tartalmat és ID-kat ad.
 
 A teljes SHA-256 a dokumentumazonosító. A név a tisztított stemből és 8 hash-karakterből
 áll; könyvtárnév-ütközésnél további véletlen suffix véd a felülírástól.
@@ -123,8 +206,9 @@ A „veszteségmentes” a DoclingDocument natív szerializálását jelenti, ne
 hogy a konverter a forrás minden vizuális részletét felismeri.
 
 A folytatás alapja a `last_successful_state`. Félbeszakadt `CONVERTING` újrafut;
-a `CONVERTED` nem konvertálódik újra. Sikeres állapot után a JSON kézi törlését
-vagy sérülését ez a verzió nem javítja automatikusan.
+a `CONVERTED` nem konvertálódik újra, hanem `CHUNKING` felé halad, ha a maximum
+`CHUNKED`. Félbeszakadt chunkolás teljes új staging készlettel fut újra. Hiányzó,
+sérült vagy nem visszatölthető natív JSON dokumentumszintű `CHUNKING` hibát ad.
 
 Konverziós hiba és nem támogatott típus esetén a teljes munkakönyvtár az `ERROR`
 alá kerül. A manifest megőrzi az utolsó sikeres állapotot, rövid hibaüzenetet,
@@ -159,8 +243,10 @@ Linux:
 ./.venv/bin/python -m pytest -m integration
 ```
 
-A normál tesztek fake adaptert, valódi DoclingDocument JSON-sémát és pytest
-ideiglenes könyvtárakat használnak; nem töltenek modelleket, nincs szolgáltatáshívás.
+A normál tesztek fake adaptert/tokenizert, valódi DoclingDocument JSON-sémát és
+pytest ideiglenes könyvtárakat használnak; nem töltenek modelleket, nincs hálózati
+vagy szolgáltatáshívás. Külön ellenőrzik a Hybrid kontextust, táblareonstrukciót,
+azonosítókat, hashértékeket, idempotenciát és megszakított publikálást.
 A külön integrációs tesztek apró MD, MARKDOWN, HTM és DOCX inputot konvertálnak
 valódi Doclinggal. A `.markdown` alias változatlan bájtokkal, `.md` nevű adatfolyamként
 kerül a Doclinghoz; az eredeti fájlnév a dokumentum origin mezőjében megmarad.
@@ -193,15 +279,24 @@ voltak futtathatók; a Python-parancsok közvetlenül használhatók.
 ## Komponensek és következő lépcső
 
 - `config.py`: típusos `.env` séma, következetes útvonalak.
-- `model.py`: verziózott manifest, állapotok, sikeres fokozatok sorrendje.
+- `model.py`: verziózott manifest és a `CHUNKING`/`CHUNKED` átmenetek.
 - `storage.py`: hash, stabilitás, útvonal-ellenőrzés, atomi JSON-tárolás.
 - `converter.py`: injektálható adapter; Docling-függőség elkülönítve.
-- `pipeline.py`: átvétel, inventory, duplikáció, folytatás, hibakezelés.
+- `chunker.py`: Hybrid adapter, táblareonstrukció, fingerprint/UUID5 és atomi csomag.
+- `pipeline.py`: átvétel, konverzió, chunkolás, folytatás és dokumentumszintű hibák.
 - `cli.py`: watch/process/status és exit code-ok.
 
-A második lépcső a `CONVERTED` állapotnál kapcsolódhat be, a natív JSON
-visszatöltésével. A manifest chunkmezői és a `CHUNKS` könyvtár elő vannak készítve;
-HybridChunker, embedding és Qdrant kód nincs ebben a változatban.
+A chunk JSON a harmadik lépcső kanonikus bemenete. A PostgreSQL később nem oszt új
+`document_id` vagy `chunk_id` értéket; PostgreSQL és Qdrant ugyanazt a most képzett
+azonosítót használja. A Qdrant point ID közvetlenül lehet a UUID-kompatibilis
+`chunk_id`, payloadja pedig majd a kereséshez/szűréshez szükséges metadata
+denormalizált részhalmazát kapja. Az adminisztratív metadata PostgreSQL-ben marad,
+a technikai azonosítók pedig továbbra sem részei az embedding szövegnek.
+
+Ismert korlát: a strukturális útvonal a Docling által felismert címsorokra épül;
+hibás forrásfelismerést nem próbál saját dokumentumparserrel javítani. Táblafejlécet
+csak explicit Docling-jelölésből fogad el. PostgreSQL, Qdrant, embedding, DONE-ba
+mozgatás és automatikus ERROR-retry a következő lépcsők feladata.
 
 A `.gitignore` kizárja az alapértelmezett adatkönyvtárak teljes tartalmát a
 `.gitkeep` kivételével, valamint a `.env`, `.venv`, log, build és cache fájlokat.

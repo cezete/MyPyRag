@@ -52,7 +52,10 @@ def main(argv: list[str] | None = None) -> int:
                         counts[manifest.current_state] += 1
                         print(
                             f"{manifest.current_state:12} {manifest.document_id[:12]} "
-                            f"{manifest.original_filename} [{directory}]"
+                            f"{manifest.original_filename} last={manifest.last_successful_state} "
+                            f"chunks={manifest.chunk_count}"
+                            + (f" error={manifest.last_error}" if manifest.last_error else "")
+                            + f" [{directory}]"
                         )
                     except Exception:
                         log.exception("Invalid manifest: %s", directory)

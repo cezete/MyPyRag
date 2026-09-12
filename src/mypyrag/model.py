@@ -1,4 +1,4 @@
-"""Versioned manifest and explicit stage-one transitions."""
+"""Versioned manifest and explicit pipeline transitions."""
 
 from dataclasses import asdict, dataclass
 from datetime import UTC, datetime
@@ -91,15 +91,19 @@ class Manifest:
         allowed = {
             State.RECEIVED: {State.CONVERTING, State.ERROR},
             State.CONVERTING: {State.CONVERTING, State.CONVERTED, State.ERROR},
-            State.CONVERTED: {State.ERROR},
-            State.ERROR: {State.CONVERTING, State.ERROR},
+            State.CONVERTED: {State.CHUNKING, State.ERROR},
+            State.CHUNKING: {State.CHUNKING, State.CHUNKED, State.ERROR},
+            State.CHUNKED: {State.ERROR},
+            State.ERROR: {State.CONVERTING, State.CHUNKING, State.ERROR},
         }
         if target not in allowed.get(self.current_state, set()):
             raise ValueError(f"Invalid transition: {self.current_state} -> {target}")
         if target == State.CONVERTING and self.last_successful_state != State.RECEIVED:
             raise ValueError("Conversion requires last_successful_state=RECEIVED")
+        if target == State.CHUNKING and self.last_successful_state != State.CONVERTED:
+            raise ValueError("Chunking requires last_successful_state=CONVERTED")
         self.current_state = target
-        if target == State.CONVERTED:
+        if target in {State.CONVERTED, State.CHUNKED}:
             self.last_successful_state = target
             self.failed_stage = None
             self.last_error = None

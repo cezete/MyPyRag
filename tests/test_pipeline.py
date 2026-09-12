@@ -78,7 +78,6 @@ def test_config_env_precedence(config, tmp_path, monkeypatch):
         ("POLL_INTERVAL_SECONDS", "0", "integer range"),
         ("FILE_STABLE_SECONDS", "-1", "integer range"),
         ("MAX_STAGE", "BROKEN", "expected CONVERTED"),
-        ("MAX_STAGE", "CHUNKED", "not implemented"),
         ("MAX_STAGE", "INDEXED", "not implemented"),
         ("IN_DIR", "", "must not be empty"),
         ("DOCLING_JSON_FILENAME", "../bad.json", "plain filename"),
@@ -102,6 +101,10 @@ def test_stage_order():
     assert not reached(State.RECEIVED, MaxStage.CONVERTED)
     assert not reached(State.CONVERTED, MaxStage.CHUNKED)
     assert reached(State.DONE, MaxStage.INDEXED)
+
+
+def test_chunked_stage_is_configurable(config):
+    assert replace(config, max_stage=MaxStage.CHUNKED).max_stage == MaxStage.CHUNKED
 
 
 def test_identity_and_name(tmp_path):
