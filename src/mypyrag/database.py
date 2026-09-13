@@ -66,13 +66,29 @@ class MigrationManager:
                     "pgvector extension is not active in the target database; "
                     "infrastructure setup is required"
                 )
-            cursor.execute(sql.SQL("CREATE SCHEMA IF NOT EXISTS {}").format(schema))
+            # PostgreSQL checks CREATE privilege even for CREATE ... IF NOT EXISTS.
+            # Avoid requiring database-level CREATE from a migration role when the
+            # application schema and catalog were already provisioned.
             cursor.execute(
-                sql.SQL(
-                    "CREATE TABLE IF NOT EXISTS {}.schema_migrations ("
-                    "version integer PRIMARY KEY, applied_at timestamptz NOT NULL DEFAULT now())"
-                ).format(schema)
+                "SELECT EXISTS (SELECT 1 FROM pg_namespace WHERE nspname = %s) AS present",
+                (self.database.config.postgres_schema,),
             )
+            schema_row = cursor.fetchone()
+            if schema_row is None or not schema_row["present"]:
+                cursor.execute(sql.SQL("CREATE SCHEMA {}").format(schema))
+            cursor.execute(
+                "SELECT to_regclass(%s) AS table_name",
+                (f"{self.database.config.postgres_schema}.schema_migrations",),
+            )
+            migration_table = cursor.fetchone()
+            if migration_table is None or migration_table["table_name"] is None:
+                cursor.execute(
+                    sql.SQL(
+                        "CREATE TABLE {}.schema_migrations ("
+                        "version integer PRIMARY KEY, "
+                        "applied_at timestamptz NOT NULL DEFAULT now())"
+                    ).format(schema)
+                )
             cursor.execute(sql.SQL("SELECT version FROM {}.schema_migrations").format(schema))
             existing = {item["version"] for item in cursor.fetchall()}
             migrations = importlib.resources.files("mypyrag.migrations")
