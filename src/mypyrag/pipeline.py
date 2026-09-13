@@ -51,6 +51,15 @@ class Pipeline:
             raise ValueError("IN, DONE and ERROR must be on the same filesystem for atomic moves")
         self.lock = FileLock(config.in_dir / ".mypyrag.lock", timeout=0)
 
+    def _database_status(
+        self, manifest: Manifest, status: str, error: str | None = None
+    ) -> None:
+        if self.indexer is None:
+            return
+        update = getattr(self.indexer.store, "set_document_status", None)
+        if callable(update):
+            update(manifest, status, error)
+
     @property
     def roots(self) -> tuple[Path, Path, Path]:
         return self.config.in_dir, self.config.done_dir, self.config.error_dir
@@ -140,6 +149,12 @@ class Pipeline:
                     f"Derived universe {derived_universe!r} does not match {selected_universe!r}"
                 )
         raw = raw.resolve()
+        inbox_root = self.config.in_dir.resolve()
+        catalog_path = (
+            f"docs/IN/{raw.relative_to(inbox_root).as_posix()}"
+            if raw.is_relative_to(inbox_root)
+            else f"docs/IN/{raw.name}"
+        )
         if raw.stat().st_dev != self.config.in_dir.stat().st_dev:
             raise ValueError("Input must be on the IN filesystem; copy it into IN first")
         for root in (self.config.done_dir, self.config.error_dir):
@@ -187,6 +202,7 @@ class Pipeline:
             received_at=timestamp,
             updated_at=timestamp,
             universe=selected_universe,
+            source_path=catalog_path,
         )
         journal = directory / "receipt.json"
         atomic_json(journal, {"raw_path": str(raw), "manifest": manifest.to_dict()})
@@ -198,6 +214,7 @@ class Pipeline:
         sync_directory(directory / "source")
         save_manifest(directory, manifest)
         journal.unlink()
+        self._database_status(manifest, "queued")
         log.info(
             "Received document_id=%s file=%s universe=%s directory=%s",
             document_id[:12],
@@ -340,12 +357,17 @@ class Pipeline:
                 return self._finish_indexed(directory, manifest)
             if manifest.current_state == State.ERROR:
                 try:
+                    self._database_status(manifest, "failed", manifest.last_error)
+                except Exception:
+                    log.exception("Failed status could not be synchronized document=%s", directory)
+                try:
                     self._move_error(directory)
                 except Exception:
                     log.exception("Error relocation still unavailable directory=%s", directory)
                 return False
             if reached(manifest.last_successful_state, self.config.max_stage):
                 return True
+            self._database_status(manifest, "processing")
             if manifest.last_successful_state == State.RECEIVED:
                 failed_stage = State.CONVERTING
                 manifest.transition(State.CONVERTING)
@@ -412,7 +434,7 @@ class Pipeline:
             manifest.indexed_point_count = count
             manifest.indexed_at = now()
             manifest.postgres_target = self.indexer.store.logical_target()
-            manifest.database_schema_version = 1
+            manifest.database_schema_version = 2
             manifest.transition(State.INDEXED)
             save_manifest(directory, manifest)
             log.info(
@@ -433,9 +455,16 @@ class Pipeline:
                     manifest.current_state = State.ERROR
                     manifest.updated_at = now()
                     save_manifest(directory, manifest)
+                except Exception:
+                    log.exception("Could not persist error manifest; preserved at %s", directory)
+                try:
+                    self._database_status(manifest, "failed", manifest.last_error)
+                except Exception:
+                    log.exception("Could not persist failed database status document=%s", directory)
+                try:
                     self._move_error(directory)
                 except Exception:
-                    log.exception("Could not persist or relocate error; preserved at %s", directory)
+                    log.exception("Could not relocate error; preserved at %s", directory)
             # Invalid manifests cannot safely be rewritten. Preserve and report every cycle.
             return False
 

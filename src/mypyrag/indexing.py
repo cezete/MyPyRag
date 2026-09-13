@@ -69,6 +69,8 @@ class SearchHit:
     structural_path: list[str]
     page_numbers: list[int]
     cosine_distance: float
+    chunk_index: int = 0
+    source_path: str = ""
 
     @property
     def cosine_similarity(self) -> float:
@@ -82,6 +84,17 @@ class UniverseSummary:
     chunks: int
 
 
+@dataclass(frozen=True)
+class SourceSummary:
+    document_id: str
+    source_path: str
+    original_filename: str
+    universe: str
+    status: str
+    chunk_count: int
+    last_error: str | None
+
+
 class EmbeddingProvider(Protocol):
     def validate_model(self) -> str: ...
 
@@ -93,7 +106,9 @@ class IndexStore(Protocol):
         self, manifest: Manifest, universe: str, chunks: list[IndexedChunk], model_digest: str
     ) -> int: ...
 
-    def search(self, vector: list[float], universe: str, limit: int) -> list[SearchHit]: ...
+    def search(
+        self, vector: list[float], universe: str | None, limit: int, path_prefix: str | None = None
+    ) -> list[SearchHit]: ...
 
     def list_universes(self) -> list[UniverseSummary]: ...
 
@@ -257,11 +272,20 @@ class SearchService:
         self.provider = provider
         self.store = store
 
-    def search(self, query: str, universe: str, limit: int | None = None) -> list[SearchHit]:
+    def search(
+        self,
+        query: str,
+        universe: str | None = None,
+        limit: int | None = None,
+        path_prefix: str | None = None,
+    ) -> list[SearchHit]:
         normalized_query = normalize_embedding_text(query)
         if not normalized_query.strip():
             raise ValueError("Search query must not be empty")
-        selected_universe = self.config.validate_universe(universe)
+        selected_universe = self.config.validate_universe(universe) if universe else None
+        selected_prefix = path_prefix.strip().strip("/\\") if path_prefix else None
+        if path_prefix is not None and not selected_prefix:
+            raise ValueError("Path prefix must not be empty")
         selected_limit = self.config.search_default_limit if limit is None else limit
         if selected_limit < 1 or selected_limit > self.config.search_max_limit:
             raise ValueError(
@@ -270,4 +294,6 @@ class SearchService:
         self.provider.validate_model()
         vectors = self.provider.embed([normalized_query])
         validate_vectors(vectors, 1, self.config.embedding_vector_size)
-        return self.store.search(vectors[0], selected_universe, selected_limit)
+        if selected_prefix is None:
+            return self.store.search(vectors[0], selected_universe, selected_limit)
+        return self.store.search(vectors[0], selected_universe, selected_limit, selected_prefix)

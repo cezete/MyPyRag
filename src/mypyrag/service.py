@@ -1,0 +1,158 @@
+"""Authenticated HTTP API for querying already-ready RAG documents."""
+
+from __future__ import annotations
+
+import argparse
+import hmac
+import logging
+from pathlib import Path
+from typing import Annotated, Any, Literal
+
+import uvicorn
+from fastapi import Depends, FastAPI, HTTPException, Query
+from fastapi.security import HTTPAuthorizationCredentials, HTTPBearer
+from pydantic import BaseModel, ConfigDict, Field
+
+from mypyrag.config import Config
+from mypyrag.indexing import SearchService
+
+log = logging.getLogger(__name__)
+
+
+class SearchRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    query: str = Field(min_length=1)
+    universe: str | None = None
+    path_prefix: str | None = None
+    top_k: int | None = None
+
+
+def _runtime(config: Config) -> tuple[SearchService, Any]:
+    from mypyrag.database import MigrationManager, PostgresDatabase, PostgresIndexStore
+    from mypyrag.ollama import OllamaEmbeddingProvider
+
+    config.require_services()
+    database = PostgresDatabase(config)
+    MigrationManager(database).require_current()
+    store = PostgresIndexStore(database)
+    return SearchService(config, OllamaEmbeddingProvider(config), store), store
+
+
+def create_app(
+    config: Config | None = None,
+    *,
+    search_service: SearchService | None = None,
+    store: Any | None = None,
+) -> FastAPI:
+    selected_config = config or Config.load()
+    if search_service is None or store is None:
+        search_service, store = _runtime(selected_config)
+
+    app = FastAPI(title="MyPyRag", version="1.0.0")
+    bearer = HTTPBearer(auto_error=False)
+
+    def authorize(
+        credentials: HTTPAuthorizationCredentials | None = Depends(bearer),  # noqa: B008
+    ) -> None:
+        valid = (
+            credentials is not None
+            and credentials.scheme.lower() == "bearer"
+            and bool(selected_config.api_token)
+            and hmac.compare_digest(credentials.credentials, selected_config.api_token)
+        )
+        if not valid:
+            raise HTTPException(
+                status_code=401,
+                detail="Unauthorized",
+                headers={"WWW-Authenticate": "Bearer"},
+            )
+
+    @app.get("/health")
+    def health() -> dict[str, str]:
+        try:
+            store.health()
+        except Exception as exc:
+            log.warning("Database health check failed: %s", exc)
+            raise HTTPException(
+                status_code=503,
+                detail={"status": "degraded", "service": "mypyrag", "database": "error"},
+            ) from exc
+        return {"status": "ok", "service": "mypyrag", "database": "ok"}
+
+    @app.post("/search", dependencies=[Depends(authorize)])
+    def search(request: SearchRequest) -> dict[str, Any]:
+        try:
+            hits = search_service.search(
+                request.query, request.universe, request.top_k, request.path_prefix
+            )
+        except ValueError as exc:
+            raise HTTPException(status_code=422, detail=str(exc)) from exc
+        except Exception as exc:
+            log.exception("Search failed")
+            raise HTTPException(status_code=503, detail="Search backend unavailable") from exc
+        return {
+            "query": request.query,
+            "results": [
+                {
+                    "score": hit.cosine_similarity,
+                    "text": hit.text,
+                    "source_path": hit.source_path,
+                    "chunk_index": hit.chunk_index,
+                    "metadata": {
+                        "universe": hit.universe,
+                        "path_prefix": request.path_prefix,
+                        "title": hit.headings[-1] if hit.headings else None,
+                        "document_id": hit.document_id,
+                        "chunk_id": hit.chunk_id,
+                        "source_type": hit.source_type,
+                        "page_numbers": hit.page_numbers,
+                        "structural_path": hit.structural_path,
+                    },
+                }
+                for hit in hits
+            ],
+        }
+
+    @app.get("/universes", dependencies=[Depends(authorize)])
+    def universes() -> dict[str, list[str]]:
+        return {"universes": [item.universe for item in store.list_universes()]}
+
+    @app.get("/sources", dependencies=[Depends(authorize)])
+    def sources(
+        universe: str | None = None,
+        path_prefix: str | None = None,
+        status: Annotated[
+            Literal["queued", "processing", "ready", "failed"] | None, Query()
+        ] = None,
+    ) -> dict[str, Any]:
+        try:
+            selected_universe = (
+                selected_config.validate_universe(universe) if universe is not None else None
+            )
+            selected_prefix = path_prefix.strip().strip("/\\") if path_prefix else None
+            if path_prefix is not None and not selected_prefix:
+                raise ValueError("Path prefix must not be empty")
+            items = store.list_sources(selected_universe, selected_prefix, status)
+        except ValueError as exc:
+            raise HTTPException(status_code=422, detail=str(exc)) from exc
+        return {"sources": [item.__dict__ for item in items]}
+
+    return app
+
+
+def main(argv: list[str] | None = None) -> int:
+    parser = argparse.ArgumentParser(prog="mypyrag-service")
+    parser.add_argument("--base-dir", type=Path, default=Path.cwd())
+    args = parser.parse_args(argv)
+    config = Config.load(args.base_dir)
+    config.require_api_token()
+    logging.basicConfig(
+        level=config.log_level, format="%(asctime)s %(levelname)s %(name)s %(message)s"
+    )
+    uvicorn.run(create_app(config), host=config.service_host, port=config.service_port)
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

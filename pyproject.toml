@@ -9,15 +9,19 @@ description = "Restartable Docling ingestion and PostgreSQL/pgvector semantic se
 requires-python = ">=3.12,<3.13"
 dependencies = [
     "docling>=2.70,<3",
+    "fastapi>=0.116,<1",
     "python-dotenv>=1.1,<2",
     "filelock>=3.18,<4",
     "httpx>=0.28,<1",
     "psycopg[binary]>=3.2,<4",
     "pgvector>=0.4,<1",
+    "uvicorn>=0.35,<1",
 ]
 
 [project.scripts]
 mypyrag = "mypyrag.cli:main"
+mypyrag-service = "mypyrag.service:main"
+mypyrag-worker = "mypyrag.worker:main"
 
 [dependency-groups]
 dev = ["pytest>=8,<10", "ruff>=0.12,<1", "mypy>=1.15,<2"]

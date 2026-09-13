@@ -53,6 +53,7 @@ class Manifest:
     received_at: str
     updated_at: str
     universe: str = "n.a."
+    source_path: str | None = None
     schema_version: int = 1
     current_state: State = State.RECEIVED
     last_successful_state: State = State.RECEIVED

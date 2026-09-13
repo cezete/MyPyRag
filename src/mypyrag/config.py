@@ -45,6 +45,9 @@ class Config:
     postgres_connect_timeout_seconds: int = 10
     search_default_limit: int = 5
     search_max_limit: int = 50
+    service_host: str = "127.0.0.1"
+    service_port: int = 8765
+    api_token: str = ""
 
     def __post_init__(self) -> None:
         if not isinstance(self.max_stage, MaxStage):
@@ -63,6 +66,7 @@ class Config:
             "postgres_connect_timeout_seconds",
             "search_default_limit",
             "search_max_limit",
+            "service_port",
         ):
             value = getattr(self, name)
             if not isinstance(value, int) or value < (0 if name == "file_stable_seconds" else 1):
@@ -101,6 +105,10 @@ class Config:
             parsed = urlparse(getattr(self, field))
             if parsed.scheme not in {"http", "https"} or not parsed.netloc:
                 raise ValueError(f"MYPYRAG_{field.upper()}: expected HTTP(S) URL")
+        if not self.service_host:
+            raise ValueError("MYPYRAG_SERVICE_HOST must not be empty")
+        if self.service_port > 65535:
+            raise ValueError("MYPYRAG_SERVICE_PORT must be at most 65535")
 
     @classmethod
     def load(cls, base: Path | None = None) -> "Config":
@@ -110,7 +118,9 @@ class Config:
         def get(name: str, default: str) -> str:
             key = f"MYPYRAG_{name.upper()}"
             value = values.get(key, default)
-            if value is None or (not value.strip() and name != "postgres_password"):
+            if value is None or (
+                not value.strip() and name not in {"postgres_password", "api_token"}
+            ):
                 raise ValueError(f"{key} must not be empty")
             return value.strip()
 
@@ -157,3 +167,7 @@ class Config:
                 missing.append(f"MYPYRAG_{name.upper()}")
         if missing:
             raise ValueError("Missing configuration required for indexing/search: " + ", ".join(missing))
+
+    def require_api_token(self) -> None:
+        if not self.api_token:
+            raise ValueError("MYPYRAG_API_TOKEN must be configured for the HTTP service")

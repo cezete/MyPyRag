@@ -211,6 +211,45 @@ nem töltődnek le a vektorok Pythonba. A megjelenített similarity képlete
 RAG/MCP réteg számára. Ez a réteg már használhatja a `SearchService` interfészt;
 LLM-válaszgenerálás, reranking, MCP és webes felület még nincs implementálva.
 
+## Külön worker és HTTP service
+
+CR-002 óta a hosszú ingestion és a keresési API két önálló processz. Először
+futtasd a 2-es adatbázis-migrációt, majd indítsd őket külön terminálból:
+
+```powershell
+uv run mypyrag db migrate
+uv run mypyrag-worker
+uv run mypyrag-service
+```
+
+A modul formájú indítás is támogatott: `python -m mypyrag.worker` és
+`python -m mypyrag.service`. A service alapértelmezetten a biztonságos
+`127.0.0.1:8765` címen figyel; LAN-eléréshez állítsd be a
+`MYPYRAG_SERVICE_HOST=0.0.0.0` értéket és csak a 8765-ös HTTP portot engedd át.
+A PostgreSQL maradjon loopbackre kötve. A service indulásához kötelező a
+`MYPYRAG_API_TOKEN`.
+
+```powershell
+curl http://127.0.0.1:8765/health
+curl.exe -X POST http://127.0.0.1:8765/search `
+  -H "Authorization: Bearer $env:MYPYRAG_API_TOKEN" `
+  -H "Content-Type: application/json" `
+  -d '{"query":"What is CHROUT?","universe":"retro.c64","top_k":6}'
+curl.exe http://127.0.0.1:8765/universes `
+  -H "Authorization: Bearer $env:MYPYRAG_API_TOKEN"
+curl.exe "http://127.0.0.1:8765/sources?status=ready" `
+  -H "Authorization: Bearer $env:MYPYRAG_API_TOKEN"
+```
+
+A `/health` nyilvános; a `/search`, `/universes` és `/sources` bearer tokent
+igényel. A dokumentumkatalógus `queued`, `processing`, `ready` és `failed`
+állapotot tárol. A keresési SQL a chunkokat a dokumentumtáblához kapcsolja, és
+kizárólag `ready` dokumentumokat enged át, így a worker többórás feldolgozása
+közben a service a már kész tartalomból továbbra is válaszol.
+Módosított fájlnál a korábbi `ready` revízió a teljes feldolgozás alatt
+kereshető marad; a sikeres új indexre váltás és a régi revízió eltávolítása
+egyetlen adatbázis-tranzakcióban történik.
+
 ## Ellenőrzés
 
 Az alapértelmezett tesztcsomag nem igényel hálózatot, valódi PostgreSQL-t,

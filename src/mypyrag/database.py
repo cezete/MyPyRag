@@ -15,10 +15,10 @@ from psycopg.rows import dict_row
 from psycopg.types.json import Jsonb
 
 from mypyrag.config import Config
-from mypyrag.indexing import IndexedChunk, SearchHit, UniverseSummary
+from mypyrag.indexing import IndexedChunk, SearchHit, SourceSummary, UniverseSummary
 from mypyrag.model import Manifest
 
-SCHEMA_VERSION = 1
+SCHEMA_VERSION = 2
 log = logging.getLogger(__name__)
 
 
@@ -149,6 +149,58 @@ class PostgresIndexStore:
     def logical_target(self) -> str:
         return self.database.logical_target()
 
+    @staticmethod
+    def _source_path(manifest: Manifest, universe: str | None = None) -> str:
+        if manifest.source_path:
+            return manifest.source_path
+        selected = universe or manifest.universe
+        prefix = "" if selected == "n.a." else selected.replace(".", "/") + "/"
+        return f"docs/IN/{prefix}{manifest.original_filename}"
+
+    def set_document_status(
+        self, manifest: Manifest, status: str, error: str | None = None
+    ) -> None:
+        if status not in {"queued", "processing", "failed"}:
+            raise ValueError(f"Unsupported pre-index document status: {status}")
+        schema = sql.Identifier(self.database.config.postgres_schema)
+        with self.database.connect() as connection, connection.cursor() as cursor:
+            cursor.execute(
+                sql.SQL(
+                    "INSERT INTO {}.documents (document_id, original_filename, "
+                    "source_relative_path, source_path, source_sha256, document_type, universe, "
+                    "chunk_count, status, last_error, processing_started_at, updated_at) "
+                    "VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,"
+                    "CASE WHEN %s='processing' THEN now() ELSE NULL END,now()) "
+                    "ON CONFLICT (document_id) DO UPDATE SET status=EXCLUDED.status, "
+                    "original_filename=EXCLUDED.original_filename, "
+                    "source_relative_path=EXCLUDED.source_relative_path, "
+                    "source_path=EXCLUDED.source_path, universe=EXCLUDED.universe, "
+                    "chunk_count=EXCLUDED.chunk_count, last_error=EXCLUDED.last_error, "
+                    "processing_started_at=CASE WHEN EXCLUDED.status='processing' "
+                    "THEN COALESCE({}.documents.processing_started_at, now()) "
+                    "ELSE {}.documents.processing_started_at END, updated_at=now()"
+                ).format(schema, schema, schema),
+                (
+                    manifest.document_id,
+                    manifest.original_filename,
+                    manifest.source_relative_path,
+                    self._source_path(manifest),
+                    manifest.source_sha256,
+                    manifest.source_type,
+                    manifest.universe,
+                    manifest.chunk_count,
+                    status,
+                    error,
+                    status,
+                ),
+            )
+
+    def health(self) -> None:
+        with self.database.connect() as connection, connection.cursor() as cursor:
+            cursor.execute("SELECT 1 AS ok")
+            if cursor.fetchone() != {"ok": 1}:
+                raise RuntimeError("Database health check failed")
+
     def replace_document(
         self, manifest: Manifest, universe: str, chunks: list[IndexedChunk], model_digest: str
     ) -> int:
@@ -165,12 +217,20 @@ class PostgresIndexStore:
         )
         deleted = 0
         with self.database.connect() as connection, connection.cursor() as cursor:
+            # Atomically replace an older revision of the same logical inbox source.
+            cursor.execute(
+                sql.SQL(
+                    "DELETE FROM {}.documents WHERE source_path = %s AND document_id <> %s"
+                ).format(schema),
+                (self._source_path(manifest, universe), manifest.document_id),
+            )
             cursor.execute(
                 sql.SQL(
                     "INSERT INTO {}.documents (document_id, original_filename, source_relative_path, "
                     "source_sha256, document_type, universe, docling_version, chunking_fingerprint, "
                     "chunk_count, embedding_model, embedding_model_digest, embedding_vector_size, "
-                    "indexed_at, updated_at) VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s) "
+                    "indexed_at, source_path, status, last_error, updated_at) "
+                    "VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,'ready',NULL,%s) "
                     "ON CONFLICT (document_id) DO UPDATE SET original_filename=EXCLUDED.original_filename, "
                     "source_relative_path=EXCLUDED.source_relative_path, source_sha256=EXCLUDED.source_sha256, "
                     "document_type=EXCLUDED.document_type, universe=EXCLUDED.universe, "
@@ -178,6 +238,7 @@ class PostgresIndexStore:
                     "chunk_count=EXCLUDED.chunk_count, embedding_model=EXCLUDED.embedding_model, "
                     "embedding_model_digest=EXCLUDED.embedding_model_digest, "
                     "embedding_vector_size=EXCLUDED.embedding_vector_size, indexed_at=EXCLUDED.indexed_at, "
+                    "source_path=EXCLUDED.source_path, status='ready', last_error=NULL, "
                     "updated_at=EXCLUDED.updated_at"
                 ).format(schema),
                 (
@@ -194,6 +255,7 @@ class PostgresIndexStore:
                     model_digest,
                     self.database.config.embedding_vector_size,
                     indexed_at,
+                    self._source_path(manifest, universe),
                     indexed_at,
                 ),
             )
@@ -266,16 +328,35 @@ class PostgresIndexStore:
         )
         return len(chunks)
 
-    def search(self, vector: list[float], universe: str, limit: int) -> list[SearchHit]:
+    def search(
+        self,
+        vector: list[float],
+        universe: str | None,
+        limit: int,
+        path_prefix: str | None = None,
+    ) -> list[SearchHit]:
         schema = sql.Identifier(self.database.config.postgres_schema)
+        conditions = [sql.SQL("d.status = 'ready'")]
+        parameters: list[Any] = [Vector(vector)]
+        if universe is not None:
+            conditions.append(sql.SQL("d.universe = %s"))
+            parameters.append(universe)
+        if path_prefix is not None:
+            conditions.append(
+                sql.SQL("strpos('/' || d.source_path || '/', '/' || %s || '/') > 0")
+            )
+            parameters.append(path_prefix.replace("\\", "/"))
+        parameters.extend((Vector(vector), limit))
         with self.database.connect() as connection, connection.cursor() as cursor:
             cursor.execute(
                 sql.SQL(
-                    "SELECT chunk_id::text, document_id, original_filename, universe, source_type, "
-                    "text, headings, structural_path, page_numbers, embedding <=> %s AS cosine_distance "
-                    "FROM {}.chunks WHERE universe = %s ORDER BY embedding <=> %s LIMIT %s"
-                ).format(schema),
-                (Vector(vector), universe, Vector(vector), limit),
+                    "SELECT c.chunk_id::text, c.document_id, c.original_filename, c.universe, "
+                    "c.source_type, c.text, c.headings, c.structural_path, c.page_numbers, "
+                    "c.embedding <=> %s AS cosine_distance, c.chunk_index, d.source_path "
+                    "FROM {}.chunks c JOIN {}.documents d ON d.document_id = c.document_id "
+                    "WHERE {} ORDER BY c.embedding <=> %s LIMIT %s"
+                ).format(schema, schema, sql.SQL(" AND ").join(conditions)),
+                parameters,
             )
             return [SearchHit(**row) for row in cursor.fetchall()]
 
@@ -287,7 +368,39 @@ class PostgresIndexStore:
                     "SELECT d.universe, count(DISTINCT d.document_id) AS documents, "
                     "count(c.chunk_id) AS chunks FROM {}.documents d "
                     "LEFT JOIN {}.chunks c ON c.document_id = d.document_id "
+                    "WHERE d.status = 'ready' "
                     "GROUP BY d.universe ORDER BY d.universe"
                 ).format(schema, schema)
             )
             return [UniverseSummary(**row) for row in cursor.fetchall()]
+
+    def list_sources(
+        self,
+        universe: str | None = None,
+        path_prefix: str | None = None,
+        status: str | None = None,
+    ) -> list[SourceSummary]:
+        schema = sql.Identifier(self.database.config.postgres_schema)
+        conditions: list[sql.Composed | sql.SQL] = []
+        parameters: list[Any] = []
+        if universe is not None:
+            conditions.append(sql.SQL("universe = %s"))
+            parameters.append(universe)
+        if path_prefix is not None:
+            conditions.append(sql.SQL("strpos('/' || source_path || '/', '/' || %s || '/') > 0"))
+            parameters.append(path_prefix.replace("\\", "/"))
+        if status is not None:
+            conditions.append(sql.SQL("status = %s"))
+            parameters.append(status)
+        where: sql.Composable = sql.SQL("")
+        if conditions:
+            where = sql.SQL(" WHERE ") + sql.SQL(" AND ").join(conditions)
+        with self.database.connect() as connection, connection.cursor() as cursor:
+            cursor.execute(
+                sql.SQL(
+                    "SELECT document_id, source_path, original_filename, universe, status, "
+                    "chunk_count, last_error FROM {}{} ORDER BY source_path, document_id"
+                ).format(schema + sql.SQL(".documents"), where),
+                parameters,
+            )
+            return [SourceSummary(**row) for row in cursor.fetchall()]
