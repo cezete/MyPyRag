@@ -75,6 +75,13 @@ class SearchHit:
         return 1.0 - self.cosine_distance
 
 
+@dataclass(frozen=True)
+class UniverseSummary:
+    universe: str
+    documents: int
+    chunks: int
+
+
 class EmbeddingProvider(Protocol):
     def validate_model(self) -> str: ...
 
@@ -87,6 +94,8 @@ class IndexStore(Protocol):
     ) -> int: ...
 
     def search(self, vector: list[float], universe: str, limit: int) -> list[SearchHit]: ...
+
+    def list_universes(self) -> list[UniverseSummary]: ...
 
     def logical_target(self) -> str: ...
 
@@ -211,7 +220,7 @@ class IndexingService:
         self.reader = reader or ChunkArtifactReader()
 
     def index(self, directory: Path, manifest: Manifest) -> tuple[int, str, float]:
-        universe = self.config.normalize_universe(manifest.universe)
+        universe = self.config.validate_universe(manifest.universe)
         chunks = self.reader.read(directory, manifest)
         started = time.monotonic()
         digest = self.provider.validate_model()
@@ -252,7 +261,7 @@ class SearchService:
         normalized_query = normalize_embedding_text(query)
         if not normalized_query.strip():
             raise ValueError("Search query must not be empty")
-        selected_universe = self.config.normalize_universe(universe)
+        selected_universe = self.config.validate_universe(universe)
         selected_limit = self.config.search_default_limit if limit is None else limit
         if selected_limit < 1 or selected_limit > self.config.search_max_limit:
             raise ValueError(

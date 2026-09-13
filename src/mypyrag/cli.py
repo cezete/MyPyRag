@@ -32,6 +32,15 @@ def _services(config: Config) -> tuple[Any, Any, Any]:
     return IndexingService(config, provider, store), provider, store
 
 
+def _index_store(config: Config) -> Any:
+    from mypyrag.database import MigrationManager, PostgresDatabase, PostgresIndexStore
+
+    config.require_services()
+    database = PostgresDatabase(config)
+    MigrationManager(database).require_current()
+    return PostgresIndexStore(database)
+
+
 def _pipeline(config: Config, *, with_indexing: bool | None = None) -> Pipeline:
     enabled = config.max_stage == MaxStage.INDEXED if with_indexing is None else with_indexing
     indexer = _services(config)[0] if enabled else None
@@ -96,6 +105,8 @@ def _build_parser() -> argparse.ArgumentParser:
     search.add_argument("--universe", required=True)
     search.add_argument("--limit", type=int)
     search.add_argument("--json", action="store_true", dest="as_json")
+    list_universes = commands.add_parser("list-universes")
+    list_universes.add_argument("--json", action="store_true", dest="as_json")
     database = commands.add_parser("db")
     database_commands = database.add_subparsers(dest="db_command", required=True)
     database_commands.add_parser("migrate")
@@ -172,6 +183,29 @@ def main(argv: list[str] | None = None) -> int:
                 len(hits),
                 time.monotonic() - started,
             )
+            return 0
+        if args.command == "list-universes":
+            summaries = _index_store(config).list_universes()
+            if args.as_json:
+                print(
+                    json.dumps(
+                        [
+                            {
+                                "universe": item.universe,
+                                "documents": item.documents,
+                                "chunks": item.chunks,
+                            }
+                            for item in summaries
+                        ],
+                        ensure_ascii=False,
+                    )
+                )
+            elif summaries:
+                print(f"{'UNIVERSE':<32} {'DOCUMENTS':>10} {'CHUNKS':>10}")
+                for item in summaries:
+                    print(f"{item.universe:<32} {item.documents:>10} {item.chunks:>10}")
+            else:
+                print("No indexed universes.")
             return 0
         pipeline = _pipeline(
             config,

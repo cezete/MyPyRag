@@ -23,8 +23,11 @@ from mypyrag.storage import (
     source_path,
     sync_directory,
 )
+from mypyrag.universe import is_link_like
 
 log = logging.getLogger(__name__)
+
+TECHNICAL_SUFFIXES = (".tmp", ".part", ".partial", ".crdownload", ".swp", "~")
 
 
 class Pipeline:
@@ -41,6 +44,7 @@ class Pipeline:
         self.chunk_writer = ChunkArtifactWriter()
         self.indexer = indexer
         self.stability = StabilityTracker(config.file_stable_seconds)
+        self._warning_signatures: dict[Path, tuple[int, int]] = {}
         for root in self.roots:
             root.mkdir(parents=True, exist_ok=True)
         if len({root.stat().st_dev for root in self.roots}) != 1:
@@ -95,15 +99,54 @@ class Pipeline:
                 ok = False
         return ok
 
-    def _register(self, raw: Path) -> Path | None:
-        if raw.is_symlink() or not raw.is_file():
+    def _managed_ancestor(self, raw: Path) -> Path | None:
+        root = self.config.in_dir.resolve()
+        current = raw.parent
+        while current != root and current.is_relative_to(root):
+            if (current / "manifest.json").exists() or (current / "receipt.json").exists():
+                return current
+            current = current.parent
+        return None
+
+    def _universe_for_explicit_input(self, raw: Path) -> str:
+        root = self.config.in_dir.resolve()
+        lexical = raw.absolute()
+        resolved = raw.resolve()
+        if lexical.is_relative_to(root) and not resolved.is_relative_to(root):
+            raise ValueError(f"Input path escapes IN through a symlink: {raw}")
+        if not resolved.is_relative_to(root):
+            return "n.a."
+        managed = self._managed_ancestor(resolved)
+        if managed is not None:
+            raise ValueError(f"Cannot ingest files from managed document directory: {managed}")
+        relative = resolved.relative_to(root)
+        if len(relative.parts) == 1:
+            return "n.a."
+        universe = self.config.universe_policy.from_parts(
+            relative.parent.parts, context=f"IN path {relative.parent.as_posix()!r}"
+        )
+        self.config.universe_policy.catalog_directory(self.config.in_dir, universe)
+        return universe
+
+    def _register(self, raw: Path, universe: str | None = None) -> Path | None:
+        if is_link_like(raw) or not raw.is_file():
             raise ValueError(f"Input must be a regular, non-symlink file: {raw}")
+        derived_universe = self._universe_for_explicit_input(raw)
+        selected_universe = derived_universe
+        if universe is not None:
+            selected_universe = self.config.validate_universe(universe)
+            if selected_universe != derived_universe:
+                raise ValueError(
+                    f"Derived universe {derived_universe!r} does not match {selected_universe!r}"
+                )
         raw = raw.resolve()
         if raw.stat().st_dev != self.config.in_dir.stat().st_dev:
             raise ValueError("Input must be on the IN filesystem; copy it into IN first")
-        for root in self.roots:
-            if raw.is_relative_to(root.resolve()) and raw.parent != self.config.in_dir.resolve():
+        for root in (self.config.done_dir, self.config.error_dir):
+            if raw.is_relative_to(root.resolve()):
                 raise ValueError("Cannot ingest files from a managed document directory")
+        if self._managed_ancestor(raw) is not None:
+            raise ValueError("Cannot ingest files from a managed document directory")
         before = signature(raw)
         document_id = sha256(raw)
         if signature(raw) != before:
@@ -143,6 +186,7 @@ class Pipeline:
             source_size_bytes=before[0],
             received_at=timestamp,
             updated_at=timestamp,
+            universe=selected_universe,
         )
         journal = directory / "receipt.json"
         atomic_json(journal, {"raw_path": str(raw), "manifest": manifest.to_dict()})
@@ -154,8 +198,93 @@ class Pipeline:
         sync_directory(directory / "source")
         save_manifest(directory, manifest)
         journal.unlink()
-        log.info("Received document_id=%s directory=%s", document_id, directory)
+        log.info(
+            "Received document_id=%s file=%s universe=%s directory=%s",
+            document_id[:12],
+            manifest.original_filename,
+            manifest.universe,
+            directory,
+        )
         return directory
+
+    def _warn_once(self, path: Path, message: str, *args: object) -> None:
+        try:
+            current = signature(path)
+        except OSError:
+            return
+        if self._warning_signatures.get(path) == current:
+            return
+        self._warning_signatures[path] = current
+        log.warning(message, *args)
+
+    def _discover_inputs(self) -> dict[Path, str]:
+        """Walk the universe catalog without entering symlinks or work directories."""
+        root = self.config.in_dir.resolve()
+        root_device = root.stat().st_dev
+        found: dict[Path, str] = {}
+
+        def walk(directory: Path, parts: tuple[str, ...]) -> None:
+            try:
+                entries = sorted(directory.iterdir())
+            except OSError as exc:
+                self._warn_once(directory, "Inbox directory unreadable path=%s error=%s", directory, exc)
+                return
+            for entry in entries:
+                if entry.name.startswith("."):
+                    log.debug("Hidden inbox entry skipped path=%s", entry)
+                    continue
+                if is_link_like(entry):
+                    log.debug("Symlink inbox entry skipped path=%s", entry)
+                    continue
+                try:
+                    if entry.stat().st_dev != root_device:
+                        log.debug("Mounted inbox entry skipped path=%s", entry)
+                        continue
+                except OSError:
+                    continue
+                if entry.is_dir():
+                    relative_directory = entry.relative_to(root).as_posix()
+                    if (entry / "manifest.json").exists() or (entry / "receipt.json").exists():
+                        log.debug("Document work directory pruned path=%s", relative_directory)
+                        continue
+                    try:
+                        self.config.universe_policy.from_parts(
+                            (*parts, entry.name), context=f"IN path {relative_directory!r}"
+                        )
+                    except ValueError as exc:
+                        self._warn_once(entry, "%s", exc)
+                        continue
+                    walk(entry, (*parts, entry.name))
+                    continue
+                if not entry.is_file():
+                    continue
+                if entry.name.endswith(TECHNICAL_SUFFIXES):
+                    log.debug("Technical inbox file skipped path=%s", entry)
+                    continue
+                if entry.suffix.lower() not in FORMATS:
+                    log.debug("Unsupported inbox file skipped path=%s", entry)
+                    continue
+                relative_file = entry.relative_to(root)
+                if not parts:
+                    self._warn_once(
+                        entry,
+                        "Unclassified input ignored: %s. Place the file under %s/<universe>/.",
+                        relative_file.as_posix(),
+                        self.config.in_dir,
+                    )
+                    continue
+                universe = self.config.universe_policy.from_parts(
+                    parts, context=f"IN path {relative_file.parent.as_posix()!r}"
+                )
+                found[entry] = universe
+                log.info(
+                    "Inbox input detected relative_path=%s universe=%s",
+                    relative_file.as_posix(),
+                    universe,
+                )
+
+        walk(self.config.in_dir, ())
+        return found
 
     def _move_error(self, directory: Path) -> None:
         target = self.config.error_dir / directory.name
@@ -313,16 +442,12 @@ class Pipeline:
     def cycle(self) -> bool:
         with self.lock:
             ok = self._recover_receipts()
-            inputs = {
-                p
-                for p in self.config.in_dir.iterdir()
-                if p.is_file() and not p.is_symlink() and not p.name.startswith(".")
-            }
-            self.stability.prune(inputs)
-            for raw in sorted(inputs):
+            inputs = self._discover_inputs()
+            self.stability.prune(set(inputs))
+            for raw, universe in sorted(inputs.items()):
                 try:
                     if self.stability.ready(raw):
-                        self._register(raw)
+                        self._register(raw, universe)
                 except Exception:
                     log.exception("Cannot acquire input=%s; input/receipt preserved", raw)
                     ok = False
@@ -386,7 +511,8 @@ class Pipeline:
                 raise ValueError("Universe change after indexing requires explicit reindexing")
             if manifest.current_state not in {State.CONVERTED, State.CHUNKED, State.ERROR}:
                 raise ValueError(f"Universe cannot be changed in state {manifest.current_state}")
-            normalized = self.config.normalize_universe(universe)
+            normalized = self.config.validate_universe(universe)
+            self.config.universe_policy.catalog_directory(self.config.in_dir, normalized)
             previous = manifest.universe
             manifest.universe = normalized
             manifest.updated_at = now()

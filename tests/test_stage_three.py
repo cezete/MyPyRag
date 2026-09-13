@@ -71,7 +71,6 @@ def stage_config(tmp_path, monkeypatch):
         Config.load(tmp_path),
         max_stage=MaxStage.INDEXED,
         file_stable_seconds=0,
-        allowed_universes=("retro", "python"),
     )
 
 
@@ -111,23 +110,22 @@ def test_new_and_legacy_manifest_universe(stage_config):
     assert (directory / "manifest.json").read_bytes() == before
 
 
-def test_allowed_universes_normalize_deduplicate_and_reject_empty(tmp_path, monkeypatch):
-    monkeypatch.setenv("MYPYRAG_ALLOWED_UNIVERSES", " Retro,python,RETRO ")
-    assert Config.load(tmp_path).allowed_universes == ("retro", "python")
-    monkeypatch.setenv("MYPYRAG_ALLOWED_UNIVERSES", "retro,,python")
-    with pytest.raises(ValueError, match="empty entries"):
-        Config.load(tmp_path)
+def test_legacy_allowed_universes_environment_is_ignored(tmp_path, monkeypatch):
+    monkeypatch.setenv("MYPYRAG_ALLOWED_UNIVERSES", "old,value")
+    assert not hasattr(Config.load(tmp_path), "allowed_universes")
 
 
 def test_set_universe_updates_atomically_and_validates_state(stage_config):
     directory = make_chunked(stage_config)
     pipeline = Pipeline(stage_config, FakeConverter())
+    (stage_config.in_dir / "retro").mkdir()
+    (stage_config.in_dir / "python").mkdir()
     with patch("mypyrag.storage.os.replace", wraps=__import__("os").replace) as replace_call:
-        assert pipeline.set_universe(directory, "RETRO") == ("n.a.", "retro")
+        assert pipeline.set_universe(directory, "retro") == ("n.a.", "retro")
         assert replace_call.called
     assert load_manifest(directory).universe == "retro"
     before = (directory / "manifest.json").read_bytes()
-    with pytest.raises(ValueError, match="not allowed"):
+    with pytest.raises(ValueError, match="not present"):
         pipeline.set_universe(directory, "unknown")
     assert (directory / "manifest.json").read_bytes() == before
     manifest = load_manifest(directory)
@@ -143,6 +141,7 @@ def test_set_universe_creates_legacy_missing_key(stage_config):
     payload = json.loads(path.read_text())
     payload.pop("universe")
     atomic_json(path, payload)
+    (stage_config.in_dir / "retro").mkdir()
     Pipeline(stage_config, FakeConverter()).set_universe(directory, "retro")
     assert json.loads(path.read_text())["universe"] == "retro"
 
@@ -192,7 +191,7 @@ def test_chunk_reader_rejects_corruption_before_network(stage_config, mutation, 
 def test_invalid_universe_stops_before_embedding_and_database(stage_config):
     directory = make_chunked(stage_config)
     provider, store = FakeProvider(), FakeStore()
-    with pytest.raises(ValueError, match="set-universe"):
+    with pytest.raises(ValueError, match="not indexable"):
         IndexingService(stage_config, provider, store).index(directory, load_manifest(directory))
     assert provider.validations == 0
     assert store.replacements == []
@@ -301,12 +300,14 @@ def test_search_validation_and_forwarding(stage_config):
         SearchHit("c", "d" * 64, "x.md", "retro", "text", "body", [], [], [], 0.25)
     ]
     service = SearchService(stage_config, provider, store)
-    assert service.search("query", "RETRO", 1)[0].cosine_similarity == 0.75
+    assert service.search("query", "retro", 1)[0].cosine_similarity == 0.75
     assert store.searches[0][1:] == ("retro", 1)
     with pytest.raises(ValueError, match="empty"):
         service.search("  ", "retro")
     with pytest.raises(ValueError, match="between"):
         service.search("query", "retro", 0)
+    with pytest.raises(ValueError, match="must match"):
+        service.search("query", "RETRO", 1)
 
 
 @pytest.mark.integration

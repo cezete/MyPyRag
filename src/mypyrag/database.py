@@ -15,7 +15,7 @@ from psycopg.rows import dict_row
 from psycopg.types.json import Jsonb
 
 from mypyrag.config import Config
-from mypyrag.indexing import IndexedChunk, SearchHit
+from mypyrag.indexing import IndexedChunk, SearchHit, UniverseSummary
 from mypyrag.model import Manifest
 
 SCHEMA_VERSION = 1
@@ -278,3 +278,16 @@ class PostgresIndexStore:
                 (Vector(vector), universe, Vector(vector), limit),
             )
             return [SearchHit(**row) for row in cursor.fetchall()]
+
+    def list_universes(self) -> list[UniverseSummary]:
+        schema = sql.Identifier(self.database.config.postgres_schema)
+        with self.database.connect() as connection, connection.cursor() as cursor:
+            cursor.execute(
+                sql.SQL(
+                    "SELECT d.universe, count(DISTINCT d.document_id) AS documents, "
+                    "count(c.chunk_id) AS chunks FROM {}.documents d "
+                    "LEFT JOIN {}.chunks c ON c.document_id = d.document_id "
+                    "GROUP BY d.universe ORDER BY d.universe"
+                ).format(schema, schema)
+            )
+            return [UniverseSummary(**row) for row in cursor.fetchall()]

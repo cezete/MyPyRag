@@ -10,6 +10,7 @@ from urllib.parse import urlparse
 from dotenv import dotenv_values
 
 from mypyrag.model import MaxStage
+from mypyrag.universe import UniversePolicy
 
 
 @dataclass(frozen=True)
@@ -25,13 +26,9 @@ class Config:
     chunker: str = "hybrid"
     chunk_max_tokens: int = 512
     chunk_tokenizer: str = "nomic-ai/nomic-embed-text-v1.5"
-    allowed_universes: tuple[str, ...] = (
-        "retro",
-        "minecraft",
-        "java",
-        "python",
-        "personal_notes",
-    )
+    universe_max_depth: int = 8
+    universe_max_length: int = 128
+    universe_segment_max_length: int = 32
     ollama_url: str = "http://192.168.3.32:11434"
     embedding_model: str = "nomic-embed-text:latest"
     embedding_vector_size: int = 768
@@ -56,6 +53,9 @@ class Config:
             "poll_interval_seconds",
             "file_stable_seconds",
             "chunk_max_tokens",
+            "universe_max_depth",
+            "universe_max_length",
+            "universe_segment_max_length",
             "embedding_vector_size",
             "embedding_timeout_seconds",
             "embedding_batch_size",
@@ -85,12 +85,10 @@ class Config:
             for other in roots[i + 1 :]:
                 if root == other or root in other.parents or other in root.parents:
                     raise ValueError("IN, DONE and ERROR must be separate, non-nested directories")
-        normalized = tuple(dict.fromkeys(value.strip().lower() for value in self.allowed_universes))
-        if any(not value for value in normalized):
-            raise ValueError("MYPYRAG_ALLOWED_UNIVERSES must not contain empty entries")
-        if self.max_stage == MaxStage.INDEXED and not normalized:
-            raise ValueError("MYPYRAG_ALLOWED_UNIVERSES must not be empty for indexing")
-        object.__setattr__(self, "allowed_universes", normalized)
+        if self.universe_segment_max_length > self.universe_max_length:
+            raise ValueError(
+                "MYPYRAG_UNIVERSE_SEGMENT_MAX_LENGTH must not exceed universe maximum length"
+            )
         if self.search_default_limit > self.search_max_limit:
             raise ValueError("MYPYRAG_SEARCH_DEFAULT_LIMIT must not exceed the maximum")
         if self.embedding_vector_size != 768:
@@ -120,13 +118,6 @@ class Config:
         kwargs: dict[str, object] = {}
         for name in cls.__dataclass_fields__:
             default = getattr(defaults, name)
-            if name == "allowed_universes":
-                raw = get(name, ",".join(default))
-                parts = raw.split(",")
-                if any(not part.strip() for part in parts):
-                    raise ValueError("MYPYRAG_ALLOWED_UNIVERSES must not contain empty entries")
-                kwargs[name] = tuple(part.strip() for part in parts)
-                continue
             value = get(name, str(default))
             if name.endswith("_dir"):
                 kwargs[name] = (base / value).resolve()
@@ -148,22 +139,21 @@ class Config:
                 kwargs[name] = value
         return cls(**kwargs)  # type: ignore[arg-type]
 
-    def normalize_universe(self, value: str) -> str:
-        normalized = value.strip().lower()
-        if not normalized or normalized == "n.a." or normalized not in self.allowed_universes:
-            allowed = ", ".join(self.allowed_universes)
-            raise ValueError(
-                f"Universe {value!r} is not allowed; run 'mypyrag set-universe "
-                f"<document-directory> <universe>'. Allowed: {allowed}"
-            )
-        return normalized
+    @property
+    def universe_policy(self) -> UniversePolicy:
+        return UniversePolicy(
+            max_depth=self.universe_max_depth,
+            max_length=self.universe_max_length,
+            segment_max_length=self.universe_segment_max_length,
+        )
+
+    def validate_universe(self, value: str) -> str:
+        return self.universe_policy.validate(value)
 
     def require_services(self) -> None:
         missing = []
         for name in ("postgres_host", "postgres_database", "postgres_user", "postgres_password"):
             if not str(getattr(self, name)).strip():
                 missing.append(f"MYPYRAG_{name.upper()}")
-        if not self.allowed_universes:
-            missing.append("MYPYRAG_ALLOWED_UNIVERSES")
         if missing:
             raise ValueError("Missing configuration required for indexing/search: " + ", ".join(missing))

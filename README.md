@@ -21,21 +21,64 @@ két érték mellett az alkalmazás nem igényel adatbázis- vagy Ollama-kapcsol
 
 A manifest `universe` mezője a szemantikai témakör. Nem azonos a
 `document_type` mezővel, amely a forrásformátumot (`pdf`, `html`, `md`, …)
-jelöli. Új dokumentum alapértéke `n.a.`, ezért indexelés előtt engedélyezett
-universe-t kell választani:
+jelöli. Automatikus ingestionnél az universe egyetlen igazságforrása a
+`docs/IN` alatti könyvtárfa:
+
+```text
+docs/IN/retro/history.pdf       → retro
+docs/IN/retro/c64/manual.htm    → retro.c64
+docs/IN/java/spring/guide.pdf   → java.spring
+```
+
+A könyvtárszegmens mintája `[a-z0-9][a-z0-9_-]*`: csak kisbetűs ASCII,
+szám, kötőjel és aláhúzás használható. Egy szegmens legfeljebb 32, a teljes
+pontozott érték 128 karakter, az alapértelmezett maximális mélység 8. Ezek a
+korlátok rendre `MYPYRAG_UNIVERSE_SEGMENT_MAX_LENGTH`,
+`MYPYRAG_UNIVERSE_MAX_LENGTH` és `MYPYRAG_UNIVERSE_MAX_DEPTH` alatt állíthatók.
+A korábbi `MYPYRAG_ALLOWED_UNIVERSES` változó elavult és nincs hatása.
+
+Universe-könyvtárak létrehozása Linuxon:
+
+```bash
+mkdir -p docs/IN/retro/c64 docs/IN/retro/zx docs/IN/java/spring
+```
+
+PowerShellben:
 
 ```powershell
-uv run mypyrag set-universe docs/IN/<document-directory> retro
+New-Item -ItemType Directory -Force `
+  docs/IN/retro/c64, docs/IN/retro/zx, docs/IN/java/spring
 ```
 
-A parancs `CONVERTED`, `CHUNKED`, illetve javítható `ERROR` állapotban használható,
-és csak a manifestet módosítja atomikusan. `INDEXING`, `INDEXED` és `DONE`
-állapotban universe-váltáshoz újraindexelési folyamat szükséges. A lista
-kisbetűsre normalizált és környezeti változóban állítható:
+A watcher rekurzív, de nem követ symlinket vagy külön mountot, kihagyja a
+rejtett/technikai fájlokat, és a közvetlen `manifest.json` vagy `receipt.json`
+fájlt tartalmazó work directory teljes fáját már bejárás előtt prune-olja. Így
+a saját `source`, `JSON` és `CHUNKS` eredményei nem válhatnak új inputtá. Az
+`IN` gyökerébe tett fájl besorolatlan: helyben marad, és csak egyszeri
+figyelmeztetést kap változatlan állapot mellett.
 
-```dotenv
-MYPYRAG_ALLOWED_UNIVERSES=retro,minecraft,java,python,personal_notes
+Teljes automatikus példa:
+
+```bash
+mkdir -p docs/IN/retro/c64
+cp c64_memory_map.htm docs/IN/retro/c64/
+MYPYRAG_MAX_STAGE=INDEXED uv run mypyrag watch
 ```
+
+Az első manifest már `universe = retro.c64` értékkel készül, majd a pipeline
+emberi beavatkozás nélkül halad `DONE` állapotig. Az explicit `process` ugyanígy
+származtat universe-t, ha a fájl érvényes IN-útvonalon van. IN-en kívüli vagy
+közvetlenül az IN gyökerében megadott fájlnál a kompatibilitási `n.a.` marad.
+
+A `set-universe` megmarad régi vagy külső dokumentumok javítására:
+
+```bash
+uv run mypyrag set-universe docs/IN/<document-directory> retro.c64
+```
+
+Csak akkor fogadja el az értéket, ha a megfelelő `docs/IN/retro/c64` normál,
+nem symlink könyvtár létezik. `CONVERTED`, `CHUNKED`, illetve javítható `ERROR`
+állapotban használható; `INDEXING`, `INDEXED` és `DONE` után újraindexelés kell.
 
 ## Telepítés és konfiguráció
 
@@ -141,7 +184,7 @@ majd a könyvtár `docs/DONE` alá kerül. Megszakítás után az ismétlés ide
 be. Dokumentumhiba az adott elemet `ERROR` alá izolálja.
 
 ```powershell
-uv run mypyrag process path/to/file.pdf
+uv run mypyrag process docs/IN/retro/c64/manual.pdf
 uv run mypyrag watch
 uv run mypyrag status
 uv run mypyrag resume docs/ERROR/<document-directory>
@@ -153,10 +196,16 @@ uv run mypyrag retry-errors
 ```powershell
 uv run mypyrag search "How does RAMTAS initialize memory?" --universe retro --limit 5
 uv run mypyrag search "How does RAMTAS initialize memory?" --universe retro --json
+uv run mypyrag list-universes
+uv run mypyrag list-universes --json
 ```
 
 A query ugyanazzal a modellel és normalizálással kap embeddinget. Az universe
-szűrés és a cosine distance szerinti rendezés paraméterezett SQL-ben történik;
+szintaxisát ellenőrzi, de nem függ az aktuális IN könyvtárfától. Az indexelt
+universe-ok katalógusa a PostgreSQL, ezért egy inboxból később eltávolított
+universe továbbra is kereshető. A `list-universes` universe-onként dokumentum-
+és chunkszámot ad közvetlenül a DB-ből, Ollama-hívás nélkül. A szűrés és a
+cosine distance szerinti rendezés paraméterezett SQL-ben történik;
 nem töltődnek le a vektorok Pythonba. A megjelenített similarity képlete
 `1 - cosine_distance`. A `--json` stabil találati objektumokat ad a későbbi
 RAG/MCP réteg számára. Ez a réteg már használhatja a `SearchService` interfészt;

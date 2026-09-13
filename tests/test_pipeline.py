@@ -62,6 +62,14 @@ def put(pipeline, name="sample.md", text="# Example\n\nHello."):
     return source
 
 
+def put_in_universe(pipeline, name="sample.md", text="# Example\n\nHello.", universe="test"):
+    directory = pipeline.config.in_dir.joinpath(*universe.split("."))
+    directory.mkdir(parents=True, exist_ok=True)
+    source = directory / name
+    source.write_text(text, encoding="utf-8")
+    return source
+
+
 def test_config_env_precedence(config, tmp_path, monkeypatch):
     (tmp_path / ".env").write_text("MYPYRAG_POLL_INTERVAL_SECONDS=20\nMYPYRAG_IN_DIR=inbox\n")
     monkeypatch.setenv("MYPYRAG_POLL_INTERVAL_SECONDS", "7")
@@ -82,6 +90,8 @@ def test_config_env_precedence(config, tmp_path, monkeypatch):
         ("DOCLING_JSON_FILENAME", "../bad.json", "plain filename"),
         ("LOG_LEVEL", "mystery", "unknown logging"),
         ("OLLAMA_URL", "invalid", "HTTP"),
+        ("UNIVERSE_MAX_DEPTH", "0", "integer range"),
+        ("UNIVERSE_SEGMENT_MAX_LENGTH", "0", "integer range"),
     ],
 )
 def test_invalid_config(config, tmp_path, monkeypatch, key, value, match):
@@ -132,7 +142,7 @@ def test_stability(tmp_path):
 def test_e2e_and_restart(pipeline):
     from docling_core.types.doc import DoclingDocument
 
-    source = put(pipeline)
+    source = put_in_universe(pipeline)
     content = source.read_bytes()
     assert pipeline.cycle()
     [(directory, manifest)] = pipeline.manifests()
@@ -189,8 +199,8 @@ def test_duplicate_all_roots(pipeline, location, caplog):
 
 
 def test_failure_does_not_block_next_document(pipeline):
-    put(pipeline, "a.md", "fail")
-    put(pipeline, "b.md", "good")
+    put_in_universe(pipeline, "a.md", "fail")
+    put_in_universe(pipeline, "b.md", "good")
     assert not pipeline.cycle()
     manifests = {m.original_filename: (d, m) for d, m in pipeline.manifests()}
     directory, failed = manifests["a.md"]
@@ -250,7 +260,7 @@ def test_corrupt_manifest_preserved_and_other_work_resumes(pipeline):
 
 
 def test_name_collision_does_not_overwrite(pipeline):
-    raw = put(pipeline)
+    raw = put_in_universe(pipeline)
     occupied = pipeline.config.in_dir / safe_name(raw.stem, sha256(raw))
     occupied.mkdir()
     (occupied / "keep").write_text("original")
@@ -276,7 +286,7 @@ def test_single_writer_lock(pipeline):
 
 
 def test_acquisition_failure_preserves_source_and_recovers(pipeline):
-    raw = put(pipeline)
+    raw = put_in_universe(pipeline)
     original = raw.read_bytes()
     with patch.object(Path, "rename", side_effect=OSError("Temporary move failure")):
         assert not pipeline.cycle()
@@ -289,7 +299,7 @@ def test_acquisition_failure_preserves_source_and_recovers(pipeline):
 
 
 def test_hash_failure_preserves_input(pipeline):
-    raw = put(pipeline)
+    raw = put_in_universe(pipeline)
     with patch("mypyrag.pipeline.sha256", side_effect=OSError("Cannot read input")):
         assert not pipeline.cycle()
     assert raw.exists()
@@ -297,7 +307,7 @@ def test_hash_failure_preserves_input(pipeline):
 
 
 def test_error_move_failure_is_recovered(pipeline):
-    put(pipeline, text="fail")
+    put_in_universe(pipeline, text="fail")
     with patch.object(pipeline, "_move_error", side_effect=OSError("Cannot move yet")):
         assert not pipeline.cycle()
         assert not pipeline.cycle()
@@ -376,7 +386,7 @@ def test_real_docling_markdown(config, extension):
     from docling_core.types.doc import DoclingDocument
 
     pipeline = Pipeline(config, DoclingAdapter())
-    raw = put(pipeline, f"sample{extension}")
+    raw = put_in_universe(pipeline, f"sample{extension}")
     if extension == ".htm":
         raw.write_text("<html><body><h1>Example</h1><p>Hello.</p></body></html>")
     elif extension == ".docx":
