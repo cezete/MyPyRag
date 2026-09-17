@@ -299,9 +299,9 @@ def test_search_validation_and_forwarding(stage_config):
     store.hits = [
         SearchHit("c", "d" * 64, "x.md", "retro", "text", "body", [], [], [], 0.25)
     ]
-    service = SearchService(stage_config, provider, store)
+    service = SearchService(replace(stage_config, search_rerank_enabled=False), provider, store)
     assert service.search("query", "retro", 1)[0].cosine_similarity == 0.75
-    assert store.searches[0][1:] == ("retro", 1)
+    assert store.searches[0][1:] == ("retro", 20)
     with pytest.raises(ValueError, match="empty"):
         service.search("  ", "retro")
     with pytest.raises(ValueError, match="between"):

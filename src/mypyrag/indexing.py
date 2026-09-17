@@ -16,6 +16,7 @@ from typing import Any, Protocol
 from mypyrag.chunker import CHUNK_SCHEMA_VERSION, text_hash
 from mypyrag.config import Config
 from mypyrag.model import Manifest
+from mypyrag.reranking import Reranker, RerankingError
 
 NORMALIZATION_VERSION = "newlines-crlf-cr-to-lf-v1"
 log = logging.getLogger(__name__)
@@ -71,6 +72,7 @@ class SearchHit:
     cosine_distance: float
     chunk_index: int = 0
     source_path: str = ""
+    rerank_score: float | None = None
 
     @property
     def cosine_similarity(self) -> float:
@@ -93,6 +95,27 @@ class SourceSummary:
     status: str
     chunk_count: int
     last_error: str | None
+
+
+@dataclass(frozen=True)
+class SearchDiagnostics:
+    rerank_applied: bool
+    model: str | None
+    candidate_top_k: int
+    result_top_k: int
+    candidate_count: int
+    result_count: int
+    truncated_count: int
+    embedding_seconds: float
+    retrieval_seconds: float
+    rerank_seconds: float
+    total_seconds: float
+
+
+@dataclass(frozen=True)
+class SearchResult:
+    hits: list[SearchHit]
+    diagnostics: SearchDiagnostics
 
 
 class EmbeddingProvider(Protocol):
@@ -267,10 +290,17 @@ class IndexingService:
 
 
 class SearchService:
-    def __init__(self, config: Config, provider: EmbeddingProvider, store: IndexStore) -> None:
+    def __init__(
+        self,
+        config: Config,
+        provider: EmbeddingProvider,
+        store: IndexStore,
+        reranker: Reranker | None = None,
+    ) -> None:
         self.config = config
         self.provider = provider
         self.store = store
+        self.reranker = reranker
 
     def search(
         self,
@@ -279,6 +309,16 @@ class SearchService:
         limit: int | None = None,
         path_prefix: str | None = None,
     ) -> list[SearchHit]:
+        return self.search_detailed(query, universe, limit, path_prefix).hits
+
+    def search_detailed(
+        self,
+        query: str,
+        universe: str | None = None,
+        limit: int | None = None,
+        path_prefix: str | None = None,
+    ) -> SearchResult:
+        started = time.monotonic()
         normalized_query = normalize_embedding_text(query)
         if not normalized_query.strip():
             raise ValueError("Search query must not be empty")
@@ -291,9 +331,94 @@ class SearchService:
             raise ValueError(
                 f"Search limit must be between 1 and {self.config.search_max_limit}"
             )
+        candidate_limit = max(self.config.search_candidate_top_k, selected_limit)
         self.provider.validate_model()
+        embedding_started = time.monotonic()
         vectors = self.provider.embed([normalized_query])
         validate_vectors(vectors, 1, self.config.embedding_vector_size)
+        embedding_seconds = time.monotonic() - embedding_started
+        retrieval_started = time.monotonic()
         if selected_prefix is None:
-            return self.store.search(vectors[0], selected_universe, selected_limit)
-        return self.store.search(vectors[0], selected_universe, selected_limit, selected_prefix)
+            candidates = self.store.search(vectors[0], selected_universe, candidate_limit)
+        else:
+            candidates = self.store.search(
+                vectors[0], selected_universe, candidate_limit, selected_prefix
+            )
+        retrieval_seconds = time.monotonic() - retrieval_started
+        rerank_seconds = 0.0
+        truncated_count = 0
+        rerank_applied = self.config.search_rerank_enabled
+        model = self.config.search_rerank_model if rerank_applied else None
+        if rerank_applied and candidates:
+            if self.reranker is None:
+                raise RerankingError("Reranking is enabled but the reranker is not initialized")
+            rerank_started = time.monotonic()
+            try:
+                scored = self.reranker.score(
+                    normalized_query, [self._rerank_document(hit) for hit in candidates]
+                )
+            except RerankingError:
+                raise
+            except Exception as exc:
+                raise RerankingError("Reranker inference failed") from exc
+            if len(scored.values) != len(candidates):
+                raise RerankingError("Reranker score count does not match candidate count")
+            rerank_seconds = time.monotonic() - rerank_started
+            truncated_count = scored.truncated_count
+            ranked = sorted(
+                (
+                    (score, index, SearchHit(**{**hit.__dict__, "rerank_score": score}))
+                    for index, (hit, score) in enumerate(
+                        zip(candidates, scored.values, strict=True)
+                    )
+                ),
+                key=lambda item: (-item[0], item[1], item[2].chunk_id),
+            )
+            hits = [hit for _score, _index, hit in ranked[:selected_limit]]
+        else:
+            hits = candidates[:selected_limit]
+        total_seconds = time.monotonic() - started
+        diagnostics = SearchDiagnostics(
+            rerank_applied=rerank_applied,
+            model=model,
+            candidate_top_k=candidate_limit,
+            result_top_k=selected_limit,
+            candidate_count=len(candidates),
+            result_count=len(hits),
+            truncated_count=truncated_count,
+            embedding_seconds=embedding_seconds,
+            retrieval_seconds=retrieval_seconds,
+            rerank_seconds=rerank_seconds,
+            total_seconds=total_seconds,
+        )
+        log.info(
+            "Search universe=%s candidate_top_k=%d result_top_k=%d candidates=%d results=%d "
+            "rerank_applied=%s model=%s truncated=%d embedding_seconds=%.3f "
+            "retrieval_seconds=%.3f rerank_seconds=%.3f total_seconds=%.3f",
+            selected_universe,
+            candidate_limit,
+            selected_limit,
+            len(candidates),
+            len(hits),
+            rerank_applied,
+            model,
+            truncated_count,
+            embedding_seconds,
+            retrieval_seconds,
+            rerank_seconds,
+            total_seconds,
+        )
+        if log.isEnabledFor(logging.DEBUG):
+            log.debug(
+                "Search ranking before=%s after=%s",
+                [hit.chunk_id for hit in candidates],
+                [hit.chunk_id for hit in hits],
+            )
+        return SearchResult(hits, diagnostics)
+
+    @staticmethod
+    def _rerank_document(hit: SearchHit) -> str:
+        context = list(dict.fromkeys([*hit.structural_path, *hit.headings]))
+        if not context:
+            return hit.text
+        return f"{hit.text}\n\nContext: {' > '.join(context)}"

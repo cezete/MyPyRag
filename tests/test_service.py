@@ -3,7 +3,13 @@ from dataclasses import replace
 from fastapi.testclient import TestClient
 
 from mypyrag.config import Config
-from mypyrag.indexing import SearchHit, SourceSummary, UniverseSummary
+from mypyrag.indexing import (
+    SearchDiagnostics,
+    SearchHit,
+    SearchResult,
+    SourceSummary,
+    UniverseSummary,
+)
 from mypyrag.service import create_app
 
 
@@ -11,10 +17,9 @@ class FakeSearchService:
     def __init__(self):
         self.calls = []
 
-    def search(self, query, universe=None, limit=None, path_prefix=None):
+    def search_detailed(self, query, universe=None, limit=None, path_prefix=None):
         self.calls.append((query, universe, limit, path_prefix))
-        return [
-            SearchHit(
+        hits = [SearchHit(
                 "chunk-id",
                 "d" * 64,
                 "manual.html",
@@ -27,8 +32,20 @@ class FakeSearchService:
                 0.125,
                 7,
                 "docs/IN/retro/c64/manual.html",
+                2.25,
             )
         ]
+        diagnostics = SearchDiagnostics(
+            True, "test-model", 20, limit or 5, 1, 1, 0, 0.01, 0.02, 0.03, 0.06
+        )
+        return SearchResult(hits, diagnostics)
+
+
+class FailingRerankSearchService(FakeSearchService):
+    def search_detailed(self, query, universe=None, limit=None, path_prefix=None):
+        from mypyrag.reranking import RerankingError
+
+        raise RerankingError("inference failed")
 
 
 class FakeStore:
@@ -108,8 +125,11 @@ def test_search_response_and_filters(tmp_path, monkeypatch):
     payload = response.json()
     assert search.calls == [("What is CHROUT?", "retro", 6, "c64")]
     assert payload["results"][0]["score"] == 0.875
+    assert payload["results"][0]["rerank_score"] == 2.25
     assert payload["results"][0]["chunk_index"] == 7
     assert payload["results"][0]["metadata"]["title"] == "CHROUT"
+    assert payload["metadata"]["rerank_applied"] is True
+    assert payload["metadata"]["candidate_top_k"] == 20
 
 
 def test_universes_and_sources(tmp_path, monkeypatch):
@@ -122,3 +142,16 @@ def test_universes_and_sources(tmp_path, monkeypatch):
     assert response.status_code == 200
     assert store.source_calls == [("retro", "c64", "ready")]
     assert response.json()["sources"][0]["status"] == "ready"
+
+
+def test_reranker_failure_is_an_explicit_503(tmp_path, monkeypatch):
+    _client, _search, store = make_client(tmp_path, monkeypatch)
+    config = replace(Config.load(tmp_path), api_token="secret")
+    app = create_app(config, search_service=FailingRerankSearchService(), store=store)
+    response = TestClient(app).post(
+        "/search",
+        headers={"Authorization": "Bearer secret"},
+        json={"query": "test", "universe": "retro"},
+    )
+    assert response.status_code == 503
+    assert response.json() == {"detail": "Reranker unavailable"}

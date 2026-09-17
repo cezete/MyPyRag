@@ -209,7 +209,70 @@ cosine distance szerinti rendezés paraméterezett SQL-ben történik;
 nem töltődnek le a vektorok Pythonba. A megjelenített similarity képlete
 `1 - cosine_distance`. A `--json` stabil találati objektumokat ad a későbbi
 RAG/MCP réteg számára. Ez a réteg már használhatja a `SearchService` interfészt;
-LLM-válaszgenerálás, reranking, MCP és webes felület még nincs implementálva.
+LLM-válaszgenerálás, MCP és webes felület nincs ebben a rétegben.
+
+### Kétlépcsős keresés és reranking
+
+A közös `SearchService` előbb universe- és útvonalszűréssel kér vektoros
+jelölteket, majd a service indulásakor egyszer betöltött valódi cross-encoderrel
+újrarendezi őket. A logikai beállítások környezeti megfeleltetése:
+
+| Logikai beállítás | Környezeti kulcs | Alapérték |
+| --- | --- | --- |
+| `search.candidate_top_k` | `MYPYRAG_SEARCH_CANDIDATE_TOP_K` | `20` |
+| `search.result_top_k` | a kompatibilis `MYPYRAG_SEARCH_DEFAULT_LIMIT` | `5` |
+| végső limit felső korlátja | `MYPYRAG_SEARCH_MAX_LIMIT` | `50` |
+| `search.rerank.enabled` | `MYPYRAG_SEARCH_RERANK_ENABLED` | `true` |
+| `search.rerank.model` | `MYPYRAG_SEARCH_RERANK_MODEL` | `cross-encoder/ms-marco-MiniLM-L6-v2` |
+| `search.rerank.device` | `MYPYRAG_SEARCH_RERANK_DEVICE` | `cpu` |
+| `search.rerank.batch_size` | `MYPYRAG_SEARCH_RERANK_BATCH_SIZE` | `8` |
+| inference konkurencia | `MYPYRAG_SEARCH_RERANK_MAX_CONCURRENCY` | `1` |
+| PyTorch CPU-szálak | `MYPYRAG_SEARCH_RERANK_THREADS` | `2` |
+
+A számlálók pozitív egészek, és az alapértelmezett végső limit nem lehet nagyobb
+a jelöltkeretnél. Az eddigi explicit HTTP `top_k` és CLI `--limit` továbbra is a
+végső találatszámot kéri a meglévő maximumig. Az effektív jelöltkeret
+`max(MYPYRAG_SEARCH_CANDIDATE_TOP_K, kért végső limit)`. Kikapcsoláshoz állítsd
+`MYPYRAG_SEARCH_RERANK_ENABLED=false` értékre; ilyenkor modell sem töltődik be,
+a vektorsorrend marad, és a `rerank_score` értéke `null`.
+
+A modellinput az eredeti chunk `text` értéke és az egyszer szereplő,
+deduplikált `structural_path`/cím kontextus. A chunk törzse áll elöl, a rövid
+kontextus utána, így jobbra csonkolásnál a törzs élvez elsőbbséget. A kliensnek visszaadott `text` mindig
+az eredeti, nem a tokenizer által levágott változat. A tényleges maximális
+bemenethosszt a betöltött tokenizer adja (a kiindulási modellnél jellemzően 512
+token); a tokenizer `longest_first` szabállyal csonkolja a `(query, dokumentum)`
+párt, így a jellemzően rövidebb query megmarad. A service naplózza
+a tényleges maximumot és keresésenként a csonkolt párok számát.
+
+A service szinkron FastAPI handlerét a framework worker threadben futtatja, így
+a CPU inference nem blokkolja az async event loopot. Processzenként egy modell,
+alapból egyidejűleg egy inference és két PyTorch CPU-szál használható; ha a
+konkurencialimit foglalt, a kérés 503 hibát kap korlátlan belső sor helyett. Ez a
+2 magos HP és a párhuzamos worker számára konzervatív kiindulás, helyszíni
+méréssel módosítható.
+
+Az első bekapcsolt indulás a Hugging Face-ről letölti a modellt a szokásos
+helyi cache-be. Offline újraindítás akkor működik, ha ez a cache megmaradt (a
+felesleges hálózati próbák elkerülésére `HF_HUB_OFFLINE=1` is beállítható), vagy
+ha `MYPYRAG_SEARCH_RERANK_MODEL` egy előre letöltött helyi modellkönyvtárra
+mutat. Betöltési hiba megszakítja a service indulását; inference-hibánál nincs
+néma visszaesés vektorsorrendre. A worker nem importálja és nem inicializálja a
+rerankert.
+
+A válaszban a korábbi `score` továbbra is `1 - cosine_distance`. A külön
+`rerank_score` a cross-encoder nyers értéke, lehet negatív vagy 1-nél nagyobb;
+a két score nem azonos skála és nem százalék. Bekapcsolva a lista
+`rerank_score` szerint rendezett, ezért a régi `score` nem feltétlenül monoton.
+A felső `metadata` tartalmazza a `rerank_applied` jelzőt, az effektív limiteket,
+a darabszámokat, a truncation számlálót, a modellt, valamint az embedding,
+retrieval, reranking és teljes időt. INFO naplóba nem kerül dokumentumszöveg;
+DEBUG szinten a méréshez elérhető a chunk-azonosítók előtti/utáni sorrendje.
+
+A kiindulási MS MARCO MiniLM modell angol lekérdezésekre és angol C64-anyagra
+baseline. Magyar, illetve magyar→angol keresési minőséget ez a változtatás nem
+igazol, és automatikus fordítást nem végez. A reranker csak a vektoros jelöltek
+közül választ: ha azok között nincs magyarázó chunk, nem tud ilyet előállítani.
 
 ## Külön worker és HTTP service
 
@@ -267,6 +330,20 @@ futtathatók:
 ```powershell
 uv run pytest -m integration
 ```
+
+A valódi cross-encoder külön smoke tesztje (modellletöltéssel vagy meglévő
+cache-ből) célzottan futtatható:
+
+```powershell
+$env:MYPYRAG_RUN_RERANKER_SMOKE="1"
+uv run pytest -m integration tests/test_reranking.py
+```
+
+A 20→5, 50→5 és 100→5 összehasonlításhoz állítsd rendre a
+`MYPYRAG_SEARCH_CANDIDATE_TOP_K` értékét, indítsd újra a service-t, és ugyanazon
+query/universe mellett rögzítsd a válasz `metadata.timings_ms` mezőit és a DEBUG
+előtti/utáni chunk-sorrendet. A 20→5 marad az alapérték, amíg a HP-n mért
+eredmények más beállítást nem indokolnak.
 
 Ezekhez a szolgáltatásokat és titkokat környezeti változóban kell megadni. A
 normál tesztfutás fake embedding providert és fake repositoryt használ; lefedi a

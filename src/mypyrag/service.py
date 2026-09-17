@@ -15,6 +15,7 @@ from pydantic import BaseModel, ConfigDict, Field
 
 from mypyrag.config import Config
 from mypyrag.indexing import SearchService
+from mypyrag.reranking import RerankingError
 
 log = logging.getLogger(__name__)
 
@@ -31,12 +32,14 @@ class SearchRequest(BaseModel):
 def _runtime(config: Config) -> tuple[SearchService, Any]:
     from mypyrag.database import MigrationManager, PostgresDatabase, PostgresIndexStore
     from mypyrag.ollama import OllamaEmbeddingProvider
+    from mypyrag.reranking import create_reranker
 
     config.require_services()
     database = PostgresDatabase(config)
     MigrationManager(database).require_current()
     store = PostgresIndexStore(database)
-    return SearchService(config, OllamaEmbeddingProvider(config), store), store
+    reranker = create_reranker(config)
+    return SearchService(config, OllamaEmbeddingProvider(config), store, reranker), store
 
 
 def create_app(
@@ -83,19 +86,38 @@ def create_app(
     @app.post("/search", dependencies=[Depends(authorize)])
     def search(request: SearchRequest) -> dict[str, Any]:
         try:
-            hits = search_service.search(
+            outcome = search_service.search_detailed(
                 request.query, request.universe, request.top_k, request.path_prefix
             )
         except ValueError as exc:
             raise HTTPException(status_code=422, detail=str(exc)) from exc
+        except RerankingError as exc:
+            log.exception("Reranking failed")
+            raise HTTPException(status_code=503, detail="Reranker unavailable") from exc
         except Exception as exc:
             log.exception("Search failed")
             raise HTTPException(status_code=503, detail="Search backend unavailable") from exc
         return {
             "query": request.query,
+            "metadata": {
+                "rerank_applied": outcome.diagnostics.rerank_applied,
+                "rerank_model": outcome.diagnostics.model,
+                "candidate_top_k": outcome.diagnostics.candidate_top_k,
+                "result_top_k": outcome.diagnostics.result_top_k,
+                "candidate_count": outcome.diagnostics.candidate_count,
+                "result_count": outcome.diagnostics.result_count,
+                "truncated_count": outcome.diagnostics.truncated_count,
+                "timings_ms": {
+                    "embedding": round(outcome.diagnostics.embedding_seconds * 1000, 3),
+                    "retrieval": round(outcome.diagnostics.retrieval_seconds * 1000, 3),
+                    "reranking": round(outcome.diagnostics.rerank_seconds * 1000, 3),
+                    "total": round(outcome.diagnostics.total_seconds * 1000, 3),
+                },
+            },
             "results": [
                 {
                     "score": hit.cosine_similarity,
+                    "rerank_score": hit.rerank_score,
                     "text": hit.text,
                     "source_path": hit.source_path,
                     "chunk_index": hit.chunk_index,
@@ -110,7 +132,7 @@ def create_app(
                         "structural_path": hit.structural_path,
                     },
                 }
-                for hit in hits
+                for hit in outcome.hits
             ],
         }
 

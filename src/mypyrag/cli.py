@@ -135,10 +135,11 @@ def main(argv: list[str] | None = None) -> int:
             return 0
         if args.command == "search":
             from mypyrag.indexing import SearchService
+            from mypyrag.reranking import create_reranker
 
             _indexer, provider, store = _services(config)
             started = time.monotonic()
-            hits = SearchService(config, provider, store).search(
+            hits = SearchService(config, provider, store, create_reranker(config)).search(
                 args.query, args.universe, args.limit
             )
             if args.as_json:
@@ -149,6 +150,7 @@ def main(argv: list[str] | None = None) -> int:
                                 "rank": rank,
                                 "cosine_similarity": hit.cosine_similarity,
                                 "cosine_distance": hit.cosine_distance,
+                                "rerank_score": hit.rerank_score,
                                 "chunk_id": hit.chunk_id,
                                 "document_id": hit.document_id,
                                 "original_filename": hit.original_filename,
@@ -172,6 +174,7 @@ def main(argv: list[str] | None = None) -> int:
                     pages = ",".join(map(str, hit.page_numbers)) or "n.a."
                     print(
                         f"{rank}. similarity={hit.cosine_similarity:.6f} "
+                        f"rerank={hit.rerank_score if hit.rerank_score is not None else 'disabled'} "
                         f"chunk={hit.chunk_id} document={hit.document_id[:12]} "
                         f"file={hit.original_filename} universe={hit.universe} "
                         f"source={hit.source_type} path={context} pages={pages}\n{hit.text}\n"

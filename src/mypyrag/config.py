@@ -45,6 +45,13 @@ class Config:
     postgres_connect_timeout_seconds: int = 10
     search_default_limit: int = 5
     search_max_limit: int = 50
+    search_candidate_top_k: int = 20
+    search_rerank_enabled: bool = True
+    search_rerank_model: str = "cross-encoder/ms-marco-MiniLM-L6-v2"
+    search_rerank_device: str = "cpu"
+    search_rerank_batch_size: int = 8
+    search_rerank_max_concurrency: int = 1
+    search_rerank_threads: int = 2
     service_host: str = "127.0.0.1"
     service_port: int = 8765
     api_token: str = ""
@@ -66,6 +73,10 @@ class Config:
             "postgres_connect_timeout_seconds",
             "search_default_limit",
             "search_max_limit",
+            "search_candidate_top_k",
+            "search_rerank_batch_size",
+            "search_rerank_max_concurrency",
+            "search_rerank_threads",
             "service_port",
         ):
             value = getattr(self, name)
@@ -95,6 +106,16 @@ class Config:
             )
         if self.search_default_limit > self.search_max_limit:
             raise ValueError("MYPYRAG_SEARCH_DEFAULT_LIMIT must not exceed the maximum")
+        if self.search_default_limit > self.search_candidate_top_k:
+            raise ValueError(
+                "MYPYRAG_SEARCH_DEFAULT_LIMIT must not exceed MYPYRAG_SEARCH_CANDIDATE_TOP_K"
+            )
+        if not isinstance(self.search_rerank_enabled, bool):
+            raise TypeError("MYPYRAG_SEARCH_RERANK_ENABLED must be true or false")
+        if not self.search_rerank_model:
+            raise ValueError("MYPYRAG_SEARCH_RERANK_MODEL must not be empty")
+        if not self.search_rerank_device:
+            raise ValueError("MYPYRAG_SEARCH_RERANK_DEVICE must not be empty")
         if self.embedding_vector_size != 768:
             raise ValueError("MYPYRAG_EMBEDDING_VECTOR_SIZE must be 768")
         if not re.fullmatch(r"[a-z_][a-z0-9_]*", self.postgres_schema):
@@ -131,6 +152,11 @@ class Config:
             value = get(name, str(default))
             if name.endswith("_dir"):
                 kwargs[name] = (base / value).resolve()
+            elif isinstance(default, bool):
+                normalized = value.casefold()
+                if normalized not in {"true", "false"}:
+                    raise ValueError(f"MYPYRAG_{name.upper()}: expected true or false")
+                kwargs[name] = normalized == "true"
             elif isinstance(default, int):
                 try:
                     kwargs[name] = int(value)
