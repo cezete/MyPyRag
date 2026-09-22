@@ -55,6 +55,16 @@ class Config:
     service_host: str = "127.0.0.1"
     service_port: int = 8765
     api_token: str = ""
+    mcp_host: str = "127.0.0.1"
+    mcp_port: int = 8766
+    mcp_path: str = "/mcp"
+    mcp_rag_service_url: str = "http://127.0.0.1:8765"
+    mcp_connect_timeout_seconds: int = 10
+    mcp_read_timeout_seconds: int = 180
+    mcp_health_timeout_seconds: int = 5
+    mcp_access_token: str = ""
+    mcp_allowed_hosts: str = ""
+    mcp_allowed_origins: str = ""
 
     def __post_init__(self) -> None:
         if not isinstance(self.max_stage, MaxStage):
@@ -78,6 +88,10 @@ class Config:
             "search_rerank_max_concurrency",
             "search_rerank_threads",
             "service_port",
+            "mcp_port",
+            "mcp_connect_timeout_seconds",
+            "mcp_read_timeout_seconds",
+            "mcp_health_timeout_seconds",
         ):
             value = getattr(self, name)
             if not isinstance(value, int) or value < (0 if name == "file_stable_seconds" else 1):
@@ -130,6 +144,17 @@ class Config:
             raise ValueError("MYPYRAG_SERVICE_HOST must not be empty")
         if self.service_port > 65535:
             raise ValueError("MYPYRAG_SERVICE_PORT must be at most 65535")
+        if not self.mcp_host:
+            raise ValueError("MYPYRAG_MCP_HOST must not be empty")
+        if self.mcp_port > 65535:
+            raise ValueError("MYPYRAG_MCP_PORT must be at most 65535")
+        if not self.mcp_path.startswith("/") or self.mcp_path == "/" or self.mcp_path.endswith("/"):
+            raise ValueError("MYPYRAG_MCP_PATH must start with '/', must not be '/', and must not end with '/'")
+        parsed_rag_url = urlparse(self.mcp_rag_service_url)
+        if parsed_rag_url.scheme not in {"http", "https"} or not parsed_rag_url.netloc:
+            raise ValueError("MYPYRAG_MCP_RAG_SERVICE_URL: expected HTTP(S) URL")
+        if parsed_rag_url.query or parsed_rag_url.fragment:
+            raise ValueError("MYPYRAG_MCP_RAG_SERVICE_URL must not contain a query or fragment")
 
     @classmethod
     def load(cls, base: Path | None = None) -> "Config":
@@ -140,7 +165,15 @@ class Config:
             key = f"MYPYRAG_{name.upper()}"
             value = values.get(key, default)
             if value is None or (
-                not value.strip() and name not in {"postgres_password", "api_token"}
+                not value.strip()
+                and name
+                not in {
+                    "postgres_password",
+                    "api_token",
+                    "mcp_access_token",
+                    "mcp_allowed_hosts",
+                    "mcp_allowed_origins",
+                }
             ):
                 raise ValueError(f"{key} must not be empty")
             return value.strip()
@@ -197,3 +230,27 @@ class Config:
     def require_api_token(self) -> None:
         if not self.api_token:
             raise ValueError("MYPYRAG_API_TOKEN must be configured for the HTTP service")
+
+    def require_mcp_tokens(self) -> None:
+        missing = []
+        if not self.api_token:
+            missing.append("MYPYRAG_API_TOKEN (backend service token)")
+        if not self.mcp_access_token:
+            missing.append("MYPYRAG_MCP_ACCESS_TOKEN")
+        if missing:
+            raise ValueError("Missing configuration required for the MCP server: " + ", ".join(missing))
+
+    @staticmethod
+    def _csv_values(value: str) -> list[str]:
+        return [item.strip() for item in value.split(",") if item.strip()]
+
+    @property
+    def effective_mcp_allowed_hosts(self) -> list[str]:
+        configured = self._csv_values(self.mcp_allowed_hosts)
+        if configured:
+            return configured
+        return [f"127.0.0.1:{self.mcp_port}", f"localhost:{self.mcp_port}"]
+
+    @property
+    def effective_mcp_allowed_origins(self) -> list[str]:
+        return self._csv_values(self.mcp_allowed_origins)

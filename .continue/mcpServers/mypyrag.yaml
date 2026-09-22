@@ -1,0 +1,11 @@
+name: MyPyRag HP MCP
+version: 0.1.0
+schema: v1
+mcpServers:
+  - name: MyPyRag Nagypapi
+    type: streamable-http
+    url: http://192.168.3.4:8766/mcp
+    connectionTimeout: 10000
+    requestOptions:
+      headers:
+        Authorization: Bearer ${{ secrets.MYPYRAG_MCP_ACCESS_TOKEN }}

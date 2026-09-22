@@ -1,0 +1,21 @@
+[Unit]
+Description=MyPyRag HTTP Search Service
+After=network-online.target postgresql.service
+Wants=network-online.target
+StartLimitIntervalSec=300
+StartLimitBurst=5
+
+[Service]
+Type=simple
+User=@SERVICE_USER@
+Group=@SERVICE_GROUP@
+WorkingDirectory=@REPO_DIR@
+EnvironmentFile=@ENV_FILE@
+Environment=HF_HUB_OFFLINE=1
+ExecStart=@VENV_DIR@/bin/mypyrag-service --base-dir @REPO_DIR@
+Restart=on-failure
+RestartSec=10
+TimeoutStartSec=180
+
+[Install]
+WantedBy=multi-user.target

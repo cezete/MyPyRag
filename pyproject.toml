@@ -13,6 +13,7 @@ dependencies = [
     "python-dotenv>=1.1,<2",
     "filelock>=3.18,<4",
     "httpx>=0.28,<1",
+    "mcp==2.2.0",
     "psycopg[binary]>=3.2,<4",
     "pgvector>=0.4,<1",
     "sentence-transformers>=5,<6",
@@ -22,6 +23,7 @@ dependencies = [
 [project.scripts]
 mypyrag = "mypyrag.cli:main"
 mypyrag-service = "mypyrag.service:main"
+mypyrag-mcp = "mypyrag.mcp_server:main"
 mypyrag-worker = "mypyrag.worker:main"
 
 [dependency-groups]

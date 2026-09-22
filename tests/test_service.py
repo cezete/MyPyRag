@@ -92,9 +92,28 @@ def test_health_is_public_and_reports_database(tmp_path, monkeypatch):
         "status": "ok",
         "service": "mypyrag",
         "database": "ok",
+        "search": "ready",
     }
     failed, _search, _store = make_client(tmp_path, monkeypatch, healthy=False)
     assert failed.get("/health").status_code == 503
+
+
+def test_health_uses_readiness_probe(tmp_path, monkeypatch):
+    _client, search, store = make_client(tmp_path, monkeypatch)
+    config = replace(Config.load(tmp_path), api_token="secret")
+
+    def unavailable():
+        raise RuntimeError("embedding service offline")
+
+    app = create_app(
+        config,
+        search_service=search,
+        store=store,
+        readiness_probe=unavailable,
+    )
+    response = TestClient(app).get("/health")
+    assert response.status_code == 503
+    assert response.json()["detail"]["search"] == "not_ready"
 
 
 def test_protected_endpoints_require_exact_bearer_token(tmp_path, monkeypatch):

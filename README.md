@@ -309,6 +309,14 @@ igényel. A dokumentumkatalógus `queued`, `processing`, `ready` és `failed`
 állapotot tárol. A keresési SQL a chunkokat a dokumentumtáblához kapcsolja, és
 kizárólag `ready` dokumentumokat enged át, így a worker többórás feldolgozása
 közben a service a már kész tartalomból továbbra is válaszol.
+
+## Távoli MCP a Continue Agent számára
+
+A külön `mypyrag-mcp` (vagy `mypyrag mcp`) folyamat Streamable HTTP-n a
+`search_docs(query, universe)` és `get_rag_status()` eszközt szolgáltatja. Csak
+a meglévő HTTP service-t hívja; nem tölt embedding- vagy rerankermodellt, és nem
+kapcsolódik közvetlenül a PostgreSQL-hez. A Nagypapi systemd- és Continue-
+beállításainak teljes, megismételhető leírása: [docs/mcp-deployment.md](docs/mcp-deployment.md).
 Módosított fájlnál a korábbi `ready` revízió a teljes feldolgozás alatt
 kereshető marad; a sikeres új indexre váltás és a régi revízió eltávolítása
 egyetlen adatbázis-tranzakcióban történik.

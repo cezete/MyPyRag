@@ -1,0 +1,20 @@
+[Unit]
+Description=MyPyRag Streamable HTTP MCP Server
+After=network-online.target mypyrag-service.service
+Wants=network-online.target mypyrag-service.service
+StartLimitIntervalSec=300
+StartLimitBurst=5
+
+[Service]
+Type=simple
+User=@SERVICE_USER@
+Group=@SERVICE_GROUP@
+WorkingDirectory=@REPO_DIR@
+EnvironmentFile=@ENV_FILE@
+ExecStart=@VENV_DIR@/bin/mypyrag-mcp --base-dir @REPO_DIR@
+Restart=on-failure
+RestartSec=10
+TimeoutStartSec=30
+
+[Install]
+WantedBy=multi-user.target

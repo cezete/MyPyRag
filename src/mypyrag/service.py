@@ -5,6 +5,7 @@ from __future__ import annotations
 import argparse
 import hmac
 import logging
+from collections.abc import Callable
 from pathlib import Path
 from typing import Annotated, Any, Literal
 
@@ -29,7 +30,7 @@ class SearchRequest(BaseModel):
     top_k: int | None = None
 
 
-def _runtime(config: Config) -> tuple[SearchService, Any]:
+def _runtime(config: Config) -> tuple[SearchService, Any, Callable[[], None]]:
     from mypyrag.database import MigrationManager, PostgresDatabase, PostgresIndexStore
     from mypyrag.ollama import OllamaEmbeddingProvider
     from mypyrag.reranking import create_reranker
@@ -39,7 +40,13 @@ def _runtime(config: Config) -> tuple[SearchService, Any]:
     MigrationManager(database).require_current()
     store = PostgresIndexStore(database)
     reranker = create_reranker(config)
-    return SearchService(config, OllamaEmbeddingProvider(config), store, reranker), store
+    provider = OllamaEmbeddingProvider(config)
+
+    def readiness() -> None:
+        store.health()
+        provider.health()
+
+    return SearchService(config, provider, store, reranker), store, readiness
 
 
 def create_app(
@@ -47,10 +54,11 @@ def create_app(
     *,
     search_service: SearchService | None = None,
     store: Any | None = None,
+    readiness_probe: Callable[[], None] | None = None,
 ) -> FastAPI:
     selected_config = config or Config.load()
     if search_service is None or store is None:
-        search_service, store = _runtime(selected_config)
+        search_service, store, readiness_probe = _runtime(selected_config)
 
     app = FastAPI(title="MyPyRag", version="1.0.0")
     bearer = HTTPBearer(auto_error=False)
@@ -74,14 +82,17 @@ def create_app(
     @app.get("/health")
     def health() -> dict[str, str]:
         try:
-            store.health()
+            if readiness_probe is None:
+                store.health()
+            else:
+                readiness_probe()
         except Exception as exc:
             log.warning("Database health check failed: %s", exc)
             raise HTTPException(
                 status_code=503,
-                detail={"status": "degraded", "service": "mypyrag", "database": "error"},
+                detail={"status": "degraded", "service": "mypyrag", "search": "not_ready"},
             ) from exc
-        return {"status": "ok", "service": "mypyrag", "database": "ok"}
+        return {"status": "ok", "service": "mypyrag", "database": "ok", "search": "ready"}
 
     @app.post("/search", dependencies=[Depends(authorize)])
     def search(request: SearchRequest) -> dict[str, Any]:

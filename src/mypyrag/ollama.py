@@ -20,6 +20,28 @@ class OllamaEmbeddingProvider:
             base_url=config.ollama_url.rstrip("/"), timeout=config.embedding_timeout_seconds
         )
 
+    def health(self) -> None:
+        """Cheap readiness check: Ollama responds and the configured model is present."""
+        response = self.client.get(
+            "/api/tags", timeout=min(5, self.config.embedding_timeout_seconds)
+        )
+        response.raise_for_status()
+        models = response.json().get("models", [])
+        match = next(
+            (
+                model
+                for model in models
+                if model.get("name") == self.config.embedding_model
+                or model.get("model") == self.config.embedding_model
+            ),
+            None,
+        )
+        if match is None:
+            raise ValueError(f"Ollama model is not installed: {self.config.embedding_model}")
+        digest = str(match.get("digest", ""))
+        if self.config.embedding_model_digest and digest != self.config.embedding_model_digest:
+            raise ValueError(f"Ollama model digest mismatch for {self.config.embedding_model}")
+
     def validate_model(self) -> str:
         response = self.client.get("/api/tags")
         response.raise_for_status()

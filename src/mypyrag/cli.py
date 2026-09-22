@@ -97,6 +97,7 @@ def _build_parser() -> argparse.ArgumentParser:
     resume = commands.add_parser("resume")
     resume.add_argument("document_directory", type=Path)
     commands.add_parser("retry-errors")
+    commands.add_parser("mcp")
     set_universe = commands.add_parser("set-universe")
     set_universe.add_argument("document_directory", type=Path)
     set_universe.add_argument("universe")
@@ -123,6 +124,10 @@ def main(argv: list[str] | None = None) -> int:
         )
         if args.command == "status":
             return _status(config)
+        if args.command == "mcp":
+            from mypyrag.mcp_server import run
+
+            return run(config)
         if args.command == "db":
             from mypyrag.database import MigrationManager, PostgresDatabase
 
