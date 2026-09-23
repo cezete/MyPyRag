@@ -65,6 +65,14 @@ class Config:
     mcp_access_token: str = ""
     mcp_allowed_hosts: str = ""
     mcp_allowed_origins: str = ""
+    web_search_enabled: bool = False
+    web_search_backend_url: str = "http://127.0.0.1:8888"
+    web_search_default_results: int = 5
+    web_search_max_results: int = 10
+    web_search_max_query_chars: int = 1000
+    web_search_max_snippet_chars: int = 1000
+    web_search_timeout_seconds: int = 20
+    web_search_max_response_bytes: int = 2 * 1024 * 1024
 
     def __post_init__(self) -> None:
         if not isinstance(self.max_stage, MaxStage):
@@ -92,6 +100,12 @@ class Config:
             "mcp_connect_timeout_seconds",
             "mcp_read_timeout_seconds",
             "mcp_health_timeout_seconds",
+            "web_search_default_results",
+            "web_search_max_results",
+            "web_search_max_query_chars",
+            "web_search_max_snippet_chars",
+            "web_search_timeout_seconds",
+            "web_search_max_response_bytes",
         ):
             value = getattr(self, name)
             if not isinstance(value, int) or value < (0 if name == "file_stable_seconds" else 1):
@@ -155,6 +169,22 @@ class Config:
             raise ValueError("MYPYRAG_MCP_RAG_SERVICE_URL: expected HTTP(S) URL")
         if parsed_rag_url.query or parsed_rag_url.fragment:
             raise ValueError("MYPYRAG_MCP_RAG_SERVICE_URL must not contain a query or fragment")
+        if not isinstance(self.web_search_enabled, bool):
+            raise TypeError("MYPYRAG_WEB_SEARCH_ENABLED must be true or false")
+        if self.web_search_default_results > self.web_search_max_results:
+            raise ValueError(
+                "MYPYRAG_WEB_SEARCH_DEFAULT_RESULTS must not exceed the configured maximum"
+            )
+        if self.web_search_max_results > 10:
+            raise ValueError("MYPYRAG_WEB_SEARCH_MAX_RESULTS must not exceed 10")
+        if self.web_search_backend_url:
+            parsed_web_url = urlparse(self.web_search_backend_url)
+            if parsed_web_url.scheme not in {"http", "https"} or not parsed_web_url.netloc:
+                raise ValueError("MYPYRAG_WEB_SEARCH_BACKEND_URL: expected HTTP(S) URL")
+            if parsed_web_url.query or parsed_web_url.fragment:
+                raise ValueError(
+                    "MYPYRAG_WEB_SEARCH_BACKEND_URL must not contain a query or fragment"
+                )
 
     @classmethod
     def load(cls, base: Path | None = None) -> "Config":
@@ -173,6 +203,7 @@ class Config:
                     "mcp_access_token",
                     "mcp_allowed_hosts",
                     "mcp_allowed_origins",
+                    "web_search_backend_url",
                 }
             ):
                 raise ValueError(f"{key} must not be empty")

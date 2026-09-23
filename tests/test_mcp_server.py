@@ -13,6 +13,7 @@ from mcp.server.mcpserver.exceptions import ToolError
 
 from mypyrag.config import Config
 from mypyrag.mcp_server import RagHttpClient, create_app
+from mypyrag.web_search import SearxngSearchClient
 
 
 def configured(tmp_path, monkeypatch, **overrides):
@@ -142,6 +143,7 @@ def test_streamable_http_protocol_auth_and_backend_recovery(tmp_path, monkeypatc
         monkeypatch,
         mcp_port=port,
         mcp_allowed_hosts=f"127.0.0.1:{port}",
+        web_search_enabled=True,
     )
     state = {"online": False}
 
@@ -158,7 +160,29 @@ def test_streamable_http_protocol_auth_and_backend_recovery(tmp_path, monkeypatc
         base_url="http://backend",
         transport=httpx.MockTransport(backend_handler),
     )
-    app = create_app(config, backend=RagHttpClient(config, client=backend_http))
+    web_http = httpx.AsyncClient(
+        base_url="http://searxng",
+        transport=httpx.MockTransport(
+            lambda _request: httpx.Response(
+                200,
+                json={
+                    "results": [
+                        {
+                            "title": "C64 KERNAL PLOT",
+                            "url": "https://example.org/c64-plot",
+                            "content": "Register X is the row and Y is the column.",
+                        }
+                    ],
+                    "unresponsive_engines": [],
+                },
+            )
+        ),
+    )
+    app = create_app(
+        config,
+        backend=RagHttpClient(config, client=backend_http),
+        web_backend=SearxngSearchClient(config, client=web_http),
+    )
     server = uvicorn.Server(uvicorn.Config(app, host="127.0.0.1", port=port, log_level="error"))
     thread = threading.Thread(target=server.run, daemon=True)
     thread.start()
@@ -181,8 +205,14 @@ def test_streamable_http_protocol_auth_and_backend_recovery(tmp_path, monkeypatc
             transport = streamable_http_client(url, http_client=authenticated)
             async with Client(transport, mode="legacy") as mcp_client:
                 tools = await mcp_client.list_tools()
-                assert [tool.name for tool in tools.tools] == ["search_docs", "get_rag_status"]
+                assert [tool.name for tool in tools.tools] == [
+                    "search_docs",
+                    "get_rag_status",
+                    "web_search",
+                ]
                 assert tools.tools[0].input_schema["required"] == ["query", "universe"]
+                assert tools.tools[2].annotations.read_only_hint is True
+                assert tools.tools[2].annotations.open_world_hint is True
 
                 down = await mcp_client.call_tool("get_rag_status")
                 assert down.is_error is False
@@ -204,6 +234,14 @@ def test_streamable_http_protocol_auth_and_backend_recovery(tmp_path, monkeypatc
                 assert found.structured_content == sample_response()
                 assert "manual.pdf" in found.content[0].text
 
+                web = await mcp_client.call_tool(
+                    "web_search", {"query": "Commodore 64 KERNAL PLOT", "max_results": 1}
+                )
+                assert web.is_error is False
+                assert web.structured_content["provider"] == "searxng"
+                assert web.structured_content["results"][0]["rank"] == 1
+                assert "example.org/c64-plot" in web.content[0].text
+
                 empty_query = await mcp_client.call_tool(
                     "search_docs", {"query": "   ", "universe": "retro.c64"}
                 )
@@ -215,4 +253,5 @@ def test_streamable_http_protocol_auth_and_backend_recovery(tmp_path, monkeypatc
         server.should_exit = True
         thread.join(timeout=10)
         run(backend_http.aclose())
+        run(web_http.aclose())
     assert not thread.is_alive()

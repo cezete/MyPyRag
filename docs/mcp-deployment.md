@@ -20,6 +20,14 @@ MYPYRAG_MCP_HEALTH_TIMEOUT_SECONDS=5
 MYPYRAG_MCP_ACCESS_TOKEN=<külön-hosszú-véletlen-token>
 MYPYRAG_MCP_ALLOWED_HOSTS=192.168.3.4:8766,127.0.0.1:8766,localhost:8766
 MYPYRAG_MCP_ALLOWED_ORIGINS=
+MYPYRAG_WEB_SEARCH_ENABLED=true
+MYPYRAG_WEB_SEARCH_BACKEND_URL=http://127.0.0.1:8888
+MYPYRAG_WEB_SEARCH_DEFAULT_RESULTS=5
+MYPYRAG_WEB_SEARCH_MAX_RESULTS=10
+MYPYRAG_WEB_SEARCH_MAX_QUERY_CHARS=1000
+MYPYRAG_WEB_SEARCH_MAX_SNIPPET_CHARS=1000
+MYPYRAG_WEB_SEARCH_TIMEOUT_SECONDS=20
+MYPYRAG_WEB_SEARCH_MAX_RESPONSE_BYTES=2097152
 ```
 
 `MYPYRAG_API_TOKEN` marad a RAG service saját backend tokenje; az MCP ezt csak
@@ -31,6 +39,38 @@ elfogadja; böngészős klienshez csak a pontos origin értéket add meg.
 A jelenlegi telepítés izolált LAN-on sima HTTP, tehát bearer hitelesített, de nem
 titkosított. Internetes routerportot ne nyiss hozzá. Nem megbízható LAN vagy Wi-Fi
 esetén a végpont elé a meglévő infrastruktúrához illő TLS reverse proxy szükséges.
+
+Az új webes keresés alapértelmezésben le van tiltva, így a meglévő telepítés backend
+nélkül is változatlanul elindul. A `web_search` eszköz ilyenkor strukturált
+`web_search_disabled` hibát ad, miközben a RAG-eszközök működnek.
+
+## Privát SearXNG backend
+
+A `deploy/searxng/compose.yaml` az official `searxng/searxng` image
+`2026.9.18-0d6910ae5` verzióját rögzíti. A szolgáltatás kizárólag a Nagypapi
+`127.0.0.1:8888` címén figyel, és `restart: unless-stopped` beállítással indul újra.
+Ez egy metakereső: a lekérdezéseket külső keresőmotoroknak továbbítja, nem tartalmaz
+helyi webmásolatot, ezért az upstream motorok korlátozásai és hibái továbbra is számítanak.
+
+```bash
+cd /home/cztadmin/projects/MyPyRag/deploy/searxng
+cp .env.example .env
+umask 077
+printf 'SEARXNG_SECRET=%s\n' "$(openssl rand -hex 32)" > .env
+docker compose config --quiet
+docker compose pull
+docker compose up -d
+curl --fail --get http://127.0.0.1:8888/search \
+  --data-urlencode 'q=SearXNG test' --data 'format=json'
+```
+
+A generált `deploy/searxng/.env` nincs Gitben. A verziózott `settings.yml` explicit
+engedélyezi a JSON formátumot; enélkül a SearXNG 403 választ adhat. Ne publikáld a
+8888-as portot, és ne állíts be tetszőleges nyilvános SearXNG példányt tartaléknak.
+
+Az MCP a `/search` végpontot kódolt `q` és `format=json` paraméterekkel hívja. Az
+eredményszám-, lekérdezés-, snippet-, idő- és válaszméret-korlátok a fenti
+`MYPYRAG_WEB_SEARCH_*` értékekkel állíthatók. A hard maximum eredményszám 10.
 
 ## Függőségek és systemd
 
@@ -101,3 +141,19 @@ Próba Agent módban:
 
 A siker bizonyítéka a Continue tool-call részleteiben látható `search_docs` hívás
 és a visszakapott forrásmetaadat, nem pusztán a modell szöveges állítása.
+
+A webes, bizonyítékokra épülő munkafolyamat angol Continue szabálya és smoke-test
+promptja: [continue-web-search.md](continue-web-search.md). Mentés vagy
+**Developer: Reload Window** után ellenőrizd, hogy ugyanaz a távoli kapcsolat a
+`search_docs`, `get_rag_status` és `web_search` eszközt is hirdeti. Ez modellutasítás,
+nem determinisztikus fallback-mechanizmus.
+
+## Visszaállítás
+
+Jegyezd fel telepítés előtt a `git rev-parse HEAD` értéket. Nem destruktív visszaállításhoz
+állítsd `MYPYRAG_WEB_SEARCH_ENABLED=false` értékre, indítsd újra csak a
+`mypyrag-mcp` unitot, majd állítsd le a komponenst a
+`deploy/searxng` könyvtárban futtatott `docker compose stop` paranccsal. Kódverzió
+visszaállításához hozz létre a korábbi revisionből külön rollback commitot, pushold,
+majd a Nagypapin `git pull --ff-only` paranccsal telepítsd; ne használj force-pusht vagy
+`reset --hard` parancsot.
