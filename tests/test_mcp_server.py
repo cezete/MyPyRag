@@ -209,10 +209,16 @@ def test_streamable_http_protocol_auth_and_backend_recovery(tmp_path, monkeypatc
                     "search_docs",
                     "get_rag_status",
                     "web_search",
+                    "run_evidence_file_probe",
                 ]
                 assert tools.tools[0].input_schema["required"] == ["query", "universe"]
                 assert tools.tools[2].annotations.read_only_hint is True
                 assert tools.tools[2].annotations.open_world_hint is True
+                assert tools.tools[3].annotations.destructive_hint is True
+                assert tools.tools[3].input_schema["properties"]["mode"]["enum"] == [
+                    "fail_if_exists",
+                    "overwrite_allowed",
+                ]
 
                 down = await mcp_client.call_tool("get_rag_status")
                 assert down.is_error is False
@@ -246,6 +252,20 @@ def test_streamable_http_protocol_auth_and_backend_recovery(tmp_path, monkeypatc
                     "search_docs", {"query": "   ", "universe": "retro.c64"}
                 )
                 assert empty_query.is_error is True
+
+                probe = await mcp_client.call_tool(
+                    "run_evidence_file_probe",
+                    {
+                        "target_path": "mcp-probe.txt",
+                        "initial_content": "initial",
+                        "append_content": "+append",
+                        "mode": "fail_if_exists",
+                        "verify": True,
+                    },
+                )
+                assert probe.is_error is False
+                assert probe.structured_content["status"] == "PASS"
+                assert (tmp_path / "mcp-probe.txt").read_text(encoding="utf-8") == "initial+append"
 
     try:
         run(protocol_check())

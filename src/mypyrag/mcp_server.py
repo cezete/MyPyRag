@@ -19,6 +19,7 @@ from mcp.server.transport_security import TransportSecuritySettings
 from mcp.types import ToolAnnotations
 
 from mypyrag.config import Config
+from mypyrag.qwen_terelo import EvidenceFileProbe, ProbeMode
 from mypyrag.web_search import SearxngSearchClient, WebSearchError
 
 log = logging.getLogger(__name__)
@@ -146,6 +147,7 @@ def create_server(
 ) -> MCPServer:
     selected_backend = backend or RagHttpClient(config)
     selected_web_backend = web_backend or SearxngSearchClient(config)
+    evidence_file_probe = EvidenceFileProbe(config.mcp_workspace_dir)
 
     @asynccontextmanager
     async def lifespan(_server: MCPServer) -> AsyncIterator[McpClients]:
@@ -218,6 +220,35 @@ def create_server(
             return await clients.web.search(query, max_results)
         except WebSearchError as exc:
             raise ToolError(json.dumps(exc.as_dict(), separators=(",", ":"))) from exc
+
+    workflow_write = ToolAnnotations(
+        read_only_hint=False,
+        destructive_hint=True,
+        idempotent_hint=False,
+        open_world_hint=False,
+    )
+
+    @server.tool(annotations=workflow_write)
+    async def run_evidence_file_probe(
+        target_path: str,
+        initial_content: str,
+        append_content: str,
+        mode: ProbeMode,
+        verify: bool,
+    ) -> dict[str, Any]:
+        """Run a bounded create/read/verify/append/read/verify workflow in the workspace.
+
+        Use this high-level workflow instead of composing file or shell operations. ``target_path``
+        must be relative to the configured workspace. Inspect ``next_allowed_actions`` before
+        choosing another action; never invent a tool name or retry unchanged input in a loop.
+        """
+        return evidence_file_probe.run(
+            target_path=target_path,
+            initial_content=initial_content,
+            append_content=append_content,
+            mode=mode,
+            verify=verify,
+        )
 
     return server
 

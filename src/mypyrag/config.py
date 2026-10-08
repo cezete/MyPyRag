@@ -65,6 +65,7 @@ class Config:
     mcp_access_token: str = ""
     mcp_allowed_hosts: str = ""
     mcp_allowed_origins: str = ""
+    mcp_workspace_dir: Path = Path(".")
     web_search_enabled: bool = False
     web_search_backend_url: str = "http://127.0.0.1:8888"
     web_search_default_results: int = 5
@@ -128,6 +129,8 @@ class Config:
             for other in roots[i + 1 :]:
                 if root == other or root in other.parents or other in root.parents:
                     raise ValueError("IN, DONE and ERROR must be separate, non-nested directories")
+        if not self.mcp_workspace_dir.exists() or not self.mcp_workspace_dir.is_dir():
+            raise ValueError("MYPYRAG_MCP_WORKSPACE_DIR must be an existing directory")
         if self.universe_segment_max_length > self.universe_max_length:
             raise ValueError(
                 "MYPYRAG_UNIVERSE_SEGMENT_MAX_LENGTH must not exceed universe maximum length"
